@@ -8,6 +8,8 @@ to pull large files as quickly as possible. The default configuration uses
 - Parallel range downloads with a preallocated file target
 - Idempotent resumes using baked-in u128 marker bytes
 - Interactive CLI progress bar in terminals
+- Automatic retry with exponential backoff for network throttling or disconnects
+- Per-range idle timeout reconnects after 30 seconds without data
 - Sensible defaults with simple overrides
 - Async library API powered by tokio and reqwest
 
@@ -73,6 +75,11 @@ sequence as a marker. Each write appends the marker at the end of the chunk,
 and the next write overwrites it. When resuming, ripget scans each range for
 the last marker and starts from that offset. If no marker is found for a
 preexisting file, the range is assumed complete.
+
+## Retry behavior
+ripget retries network failures and most HTTP statuses with exponential
+backoff to handle throttling or transient outages. Only 404 and 500 responses
+are treated as fatal. Each range reconnects if no data arrives for 15 seconds.
 
 ## Limitations
 - The server must support HTTP range requests and report the full size.

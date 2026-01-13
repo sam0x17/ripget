@@ -22,14 +22,18 @@
 use std::cmp;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use futures_util::TryStreamExt;
 use memchr::memmem;
-use reqwest::header::{ACCEPT_ENCODING, CONTENT_RANGE, HeaderMap, HeaderValue, RANGE};
+use reqwest::header::{
+    ACCEPT_ENCODING, CONTENT_RANGE, HeaderMap, HeaderValue, RANGE, RETRY_AFTER,
+};
 use reqwest::{Client, StatusCode};
 use tokio::fs::OpenOptions;
 use tokio::io::{self, AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWriteExt, SeekFrom};
 use tokio::task::JoinSet;
+use tokio::time::{sleep, timeout};
 use tokio_util::io::StreamReader;
 
 /// Default number of parallel ranges used by ripget.
@@ -56,6 +60,10 @@ const fn marker_bytes() -> [u8; 32] {
 
 const MARKER_BYTES: [u8; 32] = marker_bytes();
 const MARKER_LEN: usize = 32;
+const READ_IDLE_TIMEOUT: Duration = Duration::from_secs(15);
+const RETRY_BASE_DELAY_MS: u64 = 1_000;
+const RETRY_MAX_DELAY_MS: u64 = 30_000;
+const RETRY_MAX_EXPONENT: usize = 10;
 
 /// Result type for ripget operations.
 pub type Result<T> = std::result::Result<T, RipgetError>;
@@ -124,6 +132,8 @@ struct RemoteMetadata {
 ///
 /// * `threads` defaults to 16 when `None`.
 /// * `user_agent` defaults to `ripget/<version>` when `None`.
+/// * Retries network failures with exponential backoff; 404/500 errors are fatal.
+/// * Range reads that stall for 30 seconds reconnect automatically.
 ///
 /// Use [`download_url_with_progress`] to receive progress callbacks.
 pub async fn download_url(
@@ -139,6 +149,8 @@ pub async fn download_url(
 ///
 /// * `threads` defaults to 16 when `None`.
 /// * `user_agent` defaults to `ripget/<version>` when `None`.
+/// * Retries network failures with exponential backoff; 404/500 errors are fatal.
+/// * Range reads that stall for 30 seconds reconnect automatically.
 pub async fn download_url_with_progress(
     url: impl AsRef<str>,
     dest: impl AsRef<Path>,
@@ -242,7 +254,7 @@ where
         end: expected_len - 1,
     };
     let resume = resume_offset(&dest, range, preexisting).await?;
-    let Some(offset) = resume else {
+    let Some(mut offset) = resume else {
         progress_add(&progress, expected_len);
         return Ok(DownloadReport {
             url: None,
@@ -254,7 +266,7 @@ where
 
     progress_add(&progress, offset.saturating_sub(range.start));
     skip_bytes(&mut reader, offset).await?;
-    write_range_from_reader(&mut reader, &dest, range, offset, &progress).await?;
+    write_range_from_reader(&mut reader, &dest, range, &mut offset, &progress, None).await?;
 
     Ok(DownloadReport {
         url: None,
@@ -316,19 +328,47 @@ fn build_client(user_agent: Option<&str>) -> Result<Client> {
 }
 
 async fn fetch_metadata(client: &Client, url: &str) -> Result<RemoteMetadata> {
-    let response = client.get(url).header(RANGE, "bytes=0-0").send().await?;
+    let mut attempt = 0usize;
+    loop {
+        let response = match client
+            .get(url)
+            .header(RANGE, "bytes=0-0")
+            .send()
+            .await
+        {
+            Ok(resp) => resp,
+            Err(err) => {
+                if !is_retryable_reqwest_error(&err) {
+                    return Err(RipgetError::Http(err));
+                }
+                sleep_with_backoff(attempt, None).await;
+                attempt = attempt.saturating_add(1);
+                continue;
+            }
+        };
 
-    if response.status() != StatusCode::PARTIAL_CONTENT {
-        return Err(RipgetError::RangeNotSupported(url.to_string()));
+        let status = response.status();
+        if is_fatal_status(status) {
+            return Err(RipgetError::HttpStatus {
+                status,
+                url: url.to_string(),
+            });
+        }
+        if status != StatusCode::PARTIAL_CONTENT {
+            let retry_after = retry_after_delay(response.headers());
+            sleep_with_backoff(attempt, retry_after).await;
+            attempt = attempt.saturating_add(1);
+            continue;
+        }
+
+        let content_range = response
+            .headers()
+            .get(CONTENT_RANGE)
+            .ok_or_else(|| RipgetError::ContentRangeMissing(url.to_string()))?;
+        let total_len = parse_content_range_total(content_range, url)?;
+
+        return Ok(RemoteMetadata { len: total_len });
     }
-
-    let content_range = response
-        .headers()
-        .get(CONTENT_RANGE)
-        .ok_or_else(|| RipgetError::ContentRangeMissing(url.to_string()))?;
-    let total_len = parse_content_range_total(content_range, url)?;
-
-    Ok(RemoteMetadata { len: total_len })
 }
 
 fn parse_content_range_total(value: &HeaderValue, url: &str) -> Result<u64> {
@@ -380,33 +420,76 @@ async fn download_range(
 ) -> Result<()> {
     let range_len = range.end - range.start + 1;
     let resume = resume_offset(path, range, preexisting).await?;
-    let Some(offset) = resume else {
+    let Some(mut offset) = resume else {
         progress_add(&progress, range_len);
         return Ok(());
     };
     progress_add(&progress, offset.saturating_sub(range.start));
-    if offset > range.end {
-        return Ok(());
+
+    let mut attempt = 0usize;
+    loop {
+        if offset > range.end {
+            return Ok(());
+        }
+
+        let response = match client
+            .get(url)
+            .header(RANGE, format!("bytes={}-{}", offset, range.end))
+            .send()
+            .await
+        {
+            Ok(resp) => resp,
+            Err(err) => {
+                if !is_retryable_reqwest_error(&err) {
+                    return Err(RipgetError::Http(err));
+                }
+                sleep_with_backoff(attempt, None).await;
+                attempt = attempt.saturating_add(1);
+                continue;
+            }
+        };
+
+        let status = response.status();
+        if is_fatal_status(status) {
+            return Err(RipgetError::HttpStatus {
+                status,
+                url: url.to_string(),
+            });
+        }
+        if status != StatusCode::PARTIAL_CONTENT {
+            let retry_after = retry_after_delay(response.headers());
+            sleep_with_backoff(attempt, retry_after).await;
+            attempt = attempt.saturating_add(1);
+            continue;
+        }
+
+        let stream = response
+            .bytes_stream()
+            .map_err(|err| io::Error::new(io::ErrorKind::Other, err));
+        let mut reader = StreamReader::new(stream);
+        let start_offset = offset;
+        match write_range_from_reader(
+            &mut reader,
+            path,
+            range,
+            &mut offset,
+            &progress,
+            Some(READ_IDLE_TIMEOUT),
+        )
+        .await
+        {
+            Ok(()) => return Ok(()),
+            Err(err) if is_retryable_error(&err) => {
+                if offset > start_offset {
+                    attempt = 0;
+                }
+                sleep_with_backoff(attempt, None).await;
+                attempt = attempt.saturating_add(1);
+                continue;
+            }
+            Err(err) => return Err(err),
+        }
     }
-
-    let response = client
-        .get(url)
-        .header(RANGE, format!("bytes={}-{}", offset, range.end))
-        .send()
-        .await?;
-
-    if response.status() != StatusCode::PARTIAL_CONTENT {
-        return Err(RipgetError::HttpStatus {
-            status: response.status(),
-            url: url.to_string(),
-        });
-    }
-
-    let stream = response
-        .bytes_stream()
-        .map_err(|err| io::Error::new(io::ErrorKind::Other, err));
-    let mut reader = StreamReader::new(stream);
-    write_range_from_reader(&mut reader, path, range, offset, &progress).await
 }
 
 async fn resume_offset(path: &Path, range: Range, preexisting: bool) -> Result<Option<u64>> {
@@ -463,29 +546,30 @@ async fn write_range_from_reader<R: AsyncRead + Unpin>(
     reader: &mut R,
     path: &Path,
     range: Range,
-    mut offset: u64,
+    offset: &mut u64,
     progress: &Option<Progress>,
+    idle_timeout: Option<Duration>,
 ) -> Result<()> {
-    let expected = range.end - offset + 1;
+    let expected = range.end - *offset + 1;
     let mut remaining = expected;
     let mut file = OpenOptions::new().read(true).write(true).open(path).await?;
     let mut buf = vec![0u8; BUFFER_SIZE];
 
     while remaining > 0 {
         let read_len = cmp::min(remaining as usize, BUFFER_SIZE);
-        let n = reader.read(&mut buf[..read_len]).await?;
+        let n = read_with_timeout(reader, &mut buf[..read_len], idle_timeout).await?;
         if n == 0 {
             break;
         }
 
-        file.seek(SeekFrom::Start(offset)).await?;
+        file.seek(SeekFrom::Start(*offset)).await?;
         file.write_all(&buf[..n]).await?;
         progress_add(progress, n as u64);
-        offset += n as u64;
+        *offset += n as u64;
         remaining -= n as u64;
 
-        if remaining > 0 && offset + MARKER_LEN as u64 - 1 <= range.end {
-            file.seek(SeekFrom::Start(offset)).await?;
+        if remaining > 0 && *offset + MARKER_LEN as u64 - 1 <= range.end {
+            file.seek(SeekFrom::Start(*offset)).await?;
             file.write_all(&MARKER_BYTES).await?;
         }
     }
@@ -515,6 +599,23 @@ async fn skip_bytes<R: AsyncRead + Unpin>(reader: &mut R, mut to_skip: u64) -> R
     Ok(())
 }
 
+async fn read_with_timeout<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    buf: &mut [u8],
+    idle_timeout: Option<Duration>,
+) -> io::Result<usize> {
+    match idle_timeout {
+        Some(duration) => match timeout(duration, reader.read(buf)).await {
+            Ok(result) => result,
+            Err(_) => Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "read timed out",
+            )),
+        },
+        None => reader.read(buf).await,
+    }
+}
+
 fn progress_init(progress: &Option<Progress>, total: u64) {
     if let Some(progress) = progress {
         progress.init(total);
@@ -528,6 +629,52 @@ fn progress_add(progress: &Option<Progress>, delta: u64) {
     if let Some(progress) = progress {
         progress.add(delta);
     }
+}
+
+fn is_fatal_status(status: StatusCode) -> bool {
+    status == StatusCode::NOT_FOUND || status == StatusCode::INTERNAL_SERVER_ERROR
+}
+
+fn retry_after_delay(headers: &HeaderMap) -> Option<Duration> {
+    let value = headers.get(RETRY_AFTER)?.to_str().ok()?;
+    let seconds = value.parse::<u64>().ok()?;
+    Some(Duration::from_secs(seconds))
+}
+
+fn backoff_delay(attempt: usize) -> Duration {
+    let exp = attempt.min(RETRY_MAX_EXPONENT);
+    let factor = 1u64.checked_shl(exp as u32).unwrap_or(u64::MAX);
+    let delay = RETRY_BASE_DELAY_MS.saturating_mul(factor);
+    Duration::from_millis(cmp::min(delay, RETRY_MAX_DELAY_MS))
+}
+
+async fn sleep_with_backoff(attempt: usize, retry_after: Option<Duration>) {
+    let backoff = backoff_delay(attempt);
+    let delay = retry_after.map(|value| value.max(backoff)).unwrap_or(backoff);
+    sleep(delay).await;
+}
+
+fn is_retryable_error(err: &RipgetError) -> bool {
+    match err {
+        RipgetError::UnexpectedEof { .. } => true,
+        RipgetError::Io(err) => matches!(
+            err.kind(),
+            io::ErrorKind::TimedOut
+                | io::ErrorKind::Interrupted
+                | io::ErrorKind::WouldBlock
+                | io::ErrorKind::ConnectionReset
+                | io::ErrorKind::ConnectionAborted
+                | io::ErrorKind::BrokenPipe
+                | io::ErrorKind::NotConnected
+                | io::ErrorKind::Other
+        ),
+        RipgetError::Http(_) => true,
+        _ => false,
+    }
+}
+
+fn is_retryable_reqwest_error(err: &reqwest::Error) -> bool {
+    !err.is_builder()
 }
 
 #[cfg(test)]
