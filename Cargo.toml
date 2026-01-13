@@ -1,0 +1,18 @@
+[package]
+name = "ripget"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+clap = { version = "4.5", features = ["derive"] }
+futures-util = "0.3"
+indicatif = "0.17"
+memchr = "2.7"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
+thiserror = "1.0"
+tokio = { version = "1.37", features = ["fs", "io-util", "macros", "rt-multi-thread", "sync", "time"] }
+tokio-util = { version = "0.7", features = ["io"] }
+
+[dev-dependencies]
+hyper = { version = "0.14", features = ["full"] }
+tempfile = "3.10"
