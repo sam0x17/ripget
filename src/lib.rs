@@ -465,7 +465,7 @@ async fn download_range(
 
         let stream = response
             .bytes_stream()
-            .map_err(|err| io::Error::new(io::ErrorKind::Other, err));
+            .map_err(|err| io::Error::other(err));
         let mut reader = StreamReader::new(stream);
         let start_offset = offset;
         match write_range_from_reader(
@@ -496,7 +496,7 @@ async fn resume_offset(path: &Path, range: Range, preexisting: bool) -> Result<O
     if !preexisting {
         return Ok(Some(range.start));
     }
-    Ok(find_last_marker(path, range.start, range.end).await?)
+    find_last_marker(path, range.start, range.end).await
 }
 
 async fn find_last_marker(path: &Path, start: u64, end: u64) -> Result<Option<u64>> {
