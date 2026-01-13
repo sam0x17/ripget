@@ -40,7 +40,7 @@ use tokio_util::io::StreamReader;
 pub const DEFAULT_THREADS: usize = 16;
 
 /// Fixed read buffer size used for streaming data.
-pub const BUFFER_SIZE: usize = 8 * 1024 * 1024;
+pub const BUFFER_SIZE: usize = 16 * 1024 * 1024;
 
 const MARKER_A: u128 = 0x0b933fa4efd1205406d7cce948d07562;
 const MARKER_B: u128 = 0xc229c46eda461eaf9e68fa9da89a29ba;
@@ -73,6 +73,8 @@ pub type Result<T> = std::result::Result<T, RipgetError>;
 pub enum RipgetError {
     #[error("invalid thread count: {0}")]
     InvalidThreadCount(usize),
+    #[error("invalid buffer size: {0}")]
+    InvalidBufferSize(usize),
     #[error("missing Content-Range header for {0}")]
     ContentRangeMissing(String),
     #[error("invalid Content-Range header for {0}")]
@@ -133,7 +135,8 @@ struct RemoteMetadata {
 /// * `threads` defaults to 16 when `None`.
 /// * `user_agent` defaults to `ripget/<version>` when `None`.
 /// * Retries network failures with exponential backoff; 404/500 errors are fatal.
-/// * Range reads that stall for 30 seconds reconnect automatically.
+/// * Range reads that stall for 15 seconds reconnect automatically.
+/// * Buffer size defaults to 16MB.
 ///
 /// Use [`download_url_with_progress`] to receive progress callbacks.
 pub async fn download_url(
@@ -142,7 +145,7 @@ pub async fn download_url(
     threads: Option<usize>,
     user_agent: Option<&str>,
 ) -> Result<DownloadReport> {
-    download_url_with_progress(url, dest, threads, user_agent, None).await
+    download_url_with_progress(url, dest, threads, user_agent, None, None).await
 }
 
 /// Download a URL to a file path using parallel range requests with progress.
@@ -150,17 +153,20 @@ pub async fn download_url(
 /// * `threads` defaults to 16 when `None`.
 /// * `user_agent` defaults to `ripget/<version>` when `None`.
 /// * Retries network failures with exponential backoff; 404/500 errors are fatal.
-/// * Range reads that stall for 30 seconds reconnect automatically.
+/// * Range reads that stall for 15 seconds reconnect automatically.
+/// * `buffer_size` defaults to 16MB when `None`.
 pub async fn download_url_with_progress(
     url: impl AsRef<str>,
     dest: impl AsRef<Path>,
     threads: Option<usize>,
     user_agent: Option<&str>,
     progress: Option<Progress>,
+    buffer_size: Option<usize>,
 ) -> Result<DownloadReport> {
     let url = url.as_ref();
     let dest = dest.as_ref().to_path_buf();
     let requested_threads = normalize_threads(threads)?;
+    let buffer_size = normalize_buffer_size(buffer_size)?;
     let client = build_client(user_agent)?;
     let metadata = fetch_metadata(&client, url).await?;
     progress_init(&progress, metadata.len);
@@ -186,8 +192,18 @@ pub async fn download_url_with_progress(
         let url = url.to_string();
         let dest = dest.clone();
         let progress = progress.clone();
+        let buffer_size = buffer_size;
         join_set.spawn(async move {
-            download_range(&client, &url, &dest, range, preexisting, progress).await
+            download_range(
+                &client,
+                &url,
+                &dest,
+                range,
+                preexisting,
+                progress,
+                buffer_size,
+            )
+            .await
         });
     }
 
@@ -219,22 +235,26 @@ pub async fn download_reader<R>(
 where
     R: AsyncRead + Unpin,
 {
-    download_reader_with_progress(reader, dest, expected_len, None).await
+    download_reader_with_progress(reader, dest, expected_len, None, None).await
 }
 
 /// Copy an async reader into a file path while preserving idempotent markers.
 ///
 /// This uses a single range and requires the expected length up front.
+///
+/// * `buffer_size` defaults to 16MB when `None`.
 pub async fn download_reader_with_progress<R>(
     mut reader: R,
     dest: impl AsRef<Path>,
     expected_len: u64,
     progress: Option<Progress>,
+    buffer_size: Option<usize>,
 ) -> Result<DownloadReport>
 where
     R: AsyncRead + Unpin,
 {
     let dest = dest.as_ref().to_path_buf();
+    let buffer_size = normalize_buffer_size(buffer_size)?;
     progress_init(&progress, expected_len);
     if expected_len == 0 {
         prepare_file(&dest, 0).await?;
@@ -253,7 +273,7 @@ where
         start: 0,
         end: expected_len - 1,
     };
-    let resume = resume_offset(&dest, range, preexisting).await?;
+    let resume = resume_offset(&dest, range, preexisting, buffer_size).await?;
     let Some(mut offset) = resume else {
         progress_add(&progress, expected_len);
         return Ok(DownloadReport {
@@ -265,8 +285,17 @@ where
     };
 
     progress_add(&progress, offset.saturating_sub(range.start));
-    skip_bytes(&mut reader, offset).await?;
-    write_range_from_reader(&mut reader, &dest, range, &mut offset, &progress, None).await?;
+    skip_bytes(&mut reader, offset, buffer_size).await?;
+    write_range_from_reader(
+        &mut reader,
+        &dest,
+        range,
+        &mut offset,
+        &progress,
+        buffer_size,
+        None,
+    )
+    .await?;
 
     Ok(DownloadReport {
         url: None,
@@ -282,6 +311,14 @@ fn normalize_threads(threads: Option<usize>) -> Result<usize> {
         return Err(RipgetError::InvalidThreadCount(threads));
     }
     Ok(threads)
+}
+
+fn normalize_buffer_size(buffer_size: Option<usize>) -> Result<usize> {
+    let buffer_size = buffer_size.unwrap_or(BUFFER_SIZE);
+    if buffer_size == 0 {
+        return Err(RipgetError::InvalidBufferSize(buffer_size));
+    }
+    Ok(buffer_size)
 }
 
 fn clamp_threads(threads: usize, total_len: u64) -> usize {
@@ -417,9 +454,10 @@ async fn download_range(
     range: Range,
     preexisting: bool,
     progress: Option<Progress>,
+    buffer_size: usize,
 ) -> Result<()> {
     let range_len = range.end - range.start + 1;
-    let resume = resume_offset(path, range, preexisting).await?;
+    let resume = resume_offset(path, range, preexisting, buffer_size).await?;
     let Some(mut offset) = resume else {
         progress_add(&progress, range_len);
         return Ok(());
@@ -474,6 +512,7 @@ async fn download_range(
             range,
             &mut offset,
             &progress,
+            buffer_size,
             Some(READ_IDLE_TIMEOUT),
         )
         .await
@@ -492,14 +531,24 @@ async fn download_range(
     }
 }
 
-async fn resume_offset(path: &Path, range: Range, preexisting: bool) -> Result<Option<u64>> {
+async fn resume_offset(
+    path: &Path,
+    range: Range,
+    preexisting: bool,
+    buffer_size: usize,
+) -> Result<Option<u64>> {
     if !preexisting {
         return Ok(Some(range.start));
     }
-    find_last_marker(path, range.start, range.end).await
+    find_last_marker(path, range.start, range.end, buffer_size).await
 }
 
-async fn find_last_marker(path: &Path, start: u64, end: u64) -> Result<Option<u64>> {
+async fn find_last_marker(
+    path: &Path,
+    start: u64,
+    end: u64,
+    buffer_size: usize,
+) -> Result<Option<u64>> {
     let mut file = OpenOptions::new().read(true).open(path).await?;
     file.seek(SeekFrom::Start(start)).await?;
 
@@ -508,10 +557,10 @@ async fn find_last_marker(path: &Path, start: u64, end: u64) -> Result<Option<u6
     let mut last_found: Option<u64> = None;
     let finder = memmem::Finder::new(&MARKER_BYTES);
 
-    let mut buf = vec![0u8; BUFFER_SIZE];
+    let mut buf = vec![0u8; buffer_size];
     while offset <= end {
         let remaining = (end - offset + 1) as usize;
-        let read_len = cmp::min(remaining, BUFFER_SIZE);
+        let read_len = cmp::min(remaining, buffer_size);
         let n = file.read(&mut buf[..read_len]).await?;
         if n == 0 {
             break;
@@ -548,15 +597,16 @@ async fn write_range_from_reader<R: AsyncRead + Unpin>(
     range: Range,
     offset: &mut u64,
     progress: &Option<Progress>,
+    buffer_size: usize,
     idle_timeout: Option<Duration>,
 ) -> Result<()> {
     let expected = range.end - *offset + 1;
     let mut remaining = expected;
     let mut file = OpenOptions::new().read(true).write(true).open(path).await?;
-    let mut buf = vec![0u8; BUFFER_SIZE];
+    let mut buf = vec![0u8; buffer_size];
 
     while remaining > 0 {
-        let read_len = cmp::min(remaining as usize, BUFFER_SIZE);
+        let read_len = cmp::min(remaining as usize, buffer_size);
         let n = read_with_timeout(reader, &mut buf[..read_len], idle_timeout).await?;
         if n == 0 {
             break;
@@ -581,11 +631,15 @@ async fn write_range_from_reader<R: AsyncRead + Unpin>(
     Ok(())
 }
 
-async fn skip_bytes<R: AsyncRead + Unpin>(reader: &mut R, mut to_skip: u64) -> Result<()> {
+async fn skip_bytes<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    mut to_skip: u64,
+    buffer_size: usize,
+) -> Result<()> {
     if to_skip == 0 {
         return Ok(());
     }
-    let mut buf = vec![0u8; cmp::min(BUFFER_SIZE, 64 * 1024)];
+    let mut buf = vec![0u8; cmp::min(buffer_size, 64 * 1024)];
     let expected = to_skip;
     while to_skip > 0 {
         let read_len = cmp::min(to_skip as usize, buf.len());
@@ -783,7 +837,7 @@ mod tests {
         file.seek(SeekFrom::Start(64)).await?;
         file.write_all(&MARKER_BYTES).await?;
 
-        let found = find_last_marker(&path, 0, 255).await?;
+        let found = find_last_marker(&path, 0, 255, 1024).await?;
         assert_eq!(found, Some(64));
         Ok(())
     }
@@ -887,7 +941,14 @@ mod tests {
 
         let dir = tempdir()?;
         let path = dir.path().join("progress.bin");
-        download_reader_with_progress(rx, &path, data.len() as u64, Some(progress.clone())).await?;
+        download_reader_with_progress(
+            rx,
+            &path,
+            data.len() as u64,
+            Some(progress.clone()),
+            None,
+        )
+        .await?;
 
         assert_eq!(*progress.total.lock().unwrap(), Some(data.len() as u64));
         assert_eq!(*progress.seen.lock().unwrap(), data.len() as u64);

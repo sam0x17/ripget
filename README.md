@@ -1,15 +1,19 @@
 # ripget
 
+[![Crates.io](https://img.shields.io/crates/v/ripget.svg)](https://crates.io/crates/ripget)
+[![Docs.rs](https://img.shields.io/docsrs/ripget.svg)](https://docs.rs/ripget)
+[![CI](https://github.com/sam0x17/ripget/actions/workflows/ci.yaml/badge.svg)](https://github.com/sam0x17/ripget/actions/workflows/ci.yaml)
+
 ripget is a fast, idempotent downloader that uses parallel HTTP range requests
 to pull large files as quickly as possible. The default configuration uses
-16 parallel ranges and 8MB buffers, similar in spirit to aria2c.
+16 parallel ranges and 16MB buffers, similar in spirit to aria2c.
 
 ## Features
 - Parallel range downloads with a preallocated file target
 - Idempotent resumes using baked-in u128 marker bytes
 - Interactive CLI progress bar in terminals
 - Automatic retry with exponential backoff for network throttling or disconnects
-- Per-range idle timeout reconnects after 30 seconds without data
+- Per-range idle timeout reconnects after 15 seconds without data
 - Sensible defaults with simple overrides
 - Async library API powered by tokio and reqwest
 
@@ -27,6 +31,11 @@ ripget "https://example.com/assets/large.bin"
 When run in an interactive terminal, ripget shows a progress bar on stderr.
 Use `--silent` to disable the progress bar.
 
+Override the buffer size:
+```
+ripget --cache-size 8mb "https://example.com/assets/large.bin"
+```
+
 Override the output name:
 ```
 ripget "https://example.com/assets/large.bin" my_file.blob
@@ -35,6 +44,13 @@ ripget "https://example.com/assets/large.bin" my_file.blob
 ### Environment overrides
 - `RIPGET_THREADS`: override the default parallel range count
 - `RIPGET_USER_AGENT`: override the HTTP user agent
+- `RIPGET_CACHE_SIZE`: override the read buffer size (e.g. `8mb`)
+
+### CLI options
+- `--threads <N>`: override the default parallel range count
+- `--user-agent <UA>`: override the HTTP user agent
+- `--silent`: disable the progress bar
+- `--cache-size <SIZE>`: override the read buffer size (e.g. `8mb`)
 
 ## Library usage
 ```
