@@ -25,6 +25,7 @@ ripget "https://example.com/assets/large.bin"
 ```
 
 When run in an interactive terminal, ripget shows a progress bar on stderr.
+Use `--silent` to disable the progress bar.
 
 Override the output name:
 ```

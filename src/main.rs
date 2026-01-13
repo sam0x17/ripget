@@ -29,6 +29,10 @@ struct Args {
     /// Override the HTTP user agent.
     #[arg(long = "user-agent")]
     user_agent: Option<String>,
+
+    /// Disable the interactive progress bar.
+    #[arg(long)]
+    silent: bool,
 }
 
 #[tokio::main]
@@ -54,7 +58,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         None => env::var("RIPGET_USER_AGENT").ok(),
     };
 
-    let progress_handle = if io::stderr().is_terminal() {
+    let progress_handle = if !args.silent && io::stderr().is_terminal() {
         let bar = ProgressBar::new(0);
         let style = ProgressStyle::with_template(
             "{spinner:.green} {msg} [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({bytes_per_sec}, ETA {eta})",
