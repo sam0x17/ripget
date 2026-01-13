@@ -181,15 +181,14 @@ fn parse_cache_size(value: &str) -> Result<usize, Box<dyn std::error::Error>> {
             return Err(Box::new(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!("invalid cache size suffix: {value}"),
-            )))
+            )));
         }
     };
     let bytes = number
         .checked_mul(multiplier)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "cache size overflow"))?;
-    let bytes = usize::try_from(bytes).map_err(|_| {
-        io::Error::new(io::ErrorKind::InvalidInput, "cache size too large")
-    })?;
+    let bytes = usize::try_from(bytes)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "cache size too large"))?;
     Ok(bytes)
 }
 

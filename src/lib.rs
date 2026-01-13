@@ -26,9 +26,7 @@ use std::time::Duration;
 
 use futures_util::TryStreamExt;
 use memchr::memmem;
-use reqwest::header::{
-    ACCEPT_ENCODING, CONTENT_RANGE, HeaderMap, HeaderValue, RANGE, RETRY_AFTER,
-};
+use reqwest::header::{ACCEPT_ENCODING, CONTENT_RANGE, HeaderMap, HeaderValue, RANGE, RETRY_AFTER};
 use reqwest::{Client, StatusCode};
 use tokio::fs::OpenOptions;
 use tokio::io::{self, AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWriteExt, SeekFrom};
@@ -367,12 +365,7 @@ fn build_client(user_agent: Option<&str>) -> Result<Client> {
 async fn fetch_metadata(client: &Client, url: &str) -> Result<RemoteMetadata> {
     let mut attempt = 0usize;
     loop {
-        let response = match client
-            .get(url)
-            .header(RANGE, "bytes=0-0")
-            .send()
-            .await
-        {
+        let response = match client.get(url).header(RANGE, "bytes=0-0").send().await {
             Ok(resp) => resp,
             Err(err) => {
                 if !is_retryable_reqwest_error(&err) {
@@ -501,9 +494,7 @@ async fn download_range(
             continue;
         }
 
-        let stream = response
-            .bytes_stream()
-            .map_err(|err| io::Error::other(err));
+        let stream = response.bytes_stream().map_err(|err| io::Error::other(err));
         let mut reader = StreamReader::new(stream);
         let start_offset = offset;
         match write_range_from_reader(
@@ -607,7 +598,7 @@ async fn write_range_from_reader<R: AsyncRead + Unpin>(
 
     while remaining > 0 {
         let read_len = cmp::min(remaining as usize, buffer_size);
-        let n = read_with_timeout(reader, &mut buf[..read_len], idle_timeout).await?;
+        let n = read_fully_with_timeout(reader, &mut buf[..read_len], idle_timeout).await?;
         if n == 0 {
             break;
         }
@@ -661,13 +652,26 @@ async fn read_with_timeout<R: AsyncRead + Unpin>(
     match idle_timeout {
         Some(duration) => match timeout(duration, reader.read(buf)).await {
             Ok(result) => result,
-            Err(_) => Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "read timed out",
-            )),
+            Err(_) => Err(io::Error::new(io::ErrorKind::TimedOut, "read timed out")),
         },
         None => reader.read(buf).await,
     }
+}
+
+async fn read_fully_with_timeout<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    buf: &mut [u8],
+    idle_timeout: Option<Duration>,
+) -> io::Result<usize> {
+    let mut read_total = 0usize;
+    while read_total < buf.len() {
+        let n = read_with_timeout(reader, &mut buf[read_total..], idle_timeout).await?;
+        if n == 0 {
+            break;
+        }
+        read_total += n;
+    }
+    Ok(read_total)
 }
 
 fn progress_init(progress: &Option<Progress>, total: u64) {
@@ -704,7 +708,9 @@ fn backoff_delay(attempt: usize) -> Duration {
 
 async fn sleep_with_backoff(attempt: usize, retry_after: Option<Duration>) {
     let backoff = backoff_delay(attempt);
-    let delay = retry_after.map(|value| value.max(backoff)).unwrap_or(backoff);
+    let delay = retry_after
+        .map(|value| value.max(backoff))
+        .unwrap_or(backoff);
     sleep(delay).await;
 }
 
@@ -941,14 +947,8 @@ mod tests {
 
         let dir = tempdir()?;
         let path = dir.path().join("progress.bin");
-        download_reader_with_progress(
-            rx,
-            &path,
-            data.len() as u64,
-            Some(progress.clone()),
-            None,
-        )
-        .await?;
+        download_reader_with_progress(rx, &path, data.len() as u64, Some(progress.clone()), None)
+            .await?;
 
         assert_eq!(*progress.total.lock().unwrap(), Some(data.len() as u64));
         assert_eq!(*progress.seen.lock().unwrap(), data.len() as u64);
