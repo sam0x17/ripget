@@ -14,7 +14,7 @@ ranges and 16MB buffers, similar in spirit to aria2c.
 - Interactive CLI progress bar in terminals
 - Automatic retry with exponential backoff for network throttling or disconnects
 - Per-range idle timeout reconnects after 15 seconds without data
-- Adaptive parallelism with simple overrides
+- Configurable parallelism with simple overrides
 - Async library API powered by tokio and reqwest
 
 ## Install
@@ -94,3 +94,8 @@ are treated as fatal. Each range reconnects if no data arrives for 15 seconds.
 
 ## Limitations
 - The server must support HTTP range requests and report the full size.
+
+## License
+Licensed under either of:
+- Apache License, Version 2.0 (`LICENSE-APACHE`)
+- MIT license (`LICENSE-MIT`)

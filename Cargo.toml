@@ -2,6 +2,14 @@
 name = "ripget"
 version = "0.1.0"
 edition = "2024"
+description = "Fast multi-part downloader with retries, progress, and configurable parallelism."
+readme = "README.md"
+repository = "https://github.com/sam0x17/ripget"
+homepage = "https://github.com/sam0x17/ripget"
+documentation = "https://docs.rs/ripget"
+keywords = ["download", "downloader", "http", "async", "cli"]
+categories = ["command-line-utilities", "network-programming"]
+license = "MIT OR Apache-2.0"
 
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }
