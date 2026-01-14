@@ -36,7 +36,7 @@ pub const DEFAULT_THREADS: usize = 4;
 /// Fixed read buffer size used for streaming data.
 pub const BUFFER_SIZE: usize = 16 * 1024 * 1024;
 
-const AUTO_THREAD_INTERVAL: Duration = Duration::from_secs(2);
+const AUTO_THREAD_INTERVAL: Duration = Duration::from_secs(1);
 const AUTO_CHUNK_MULTIPLIER: u64 = 4;
 const READ_IDLE_TIMEOUT: Duration = Duration::from_secs(15);
 const RETRY_BASE_DELAY_MS: u64 = 1_000;
@@ -184,7 +184,7 @@ struct RemoteMetadata {
 
 /// Download a URL to a file path using parallel range requests.
 ///
-/// * `threads` auto-scales from 4, doubling every 2 seconds while throughput
+/// * `threads` auto-scales from 4, adding 50% every second while throughput
 ///   improves, when `None`.
 /// * `user_agent` defaults to `ripget/<version>` when `None`.
 /// * Retries network failures with exponential backoff; 404/500 errors are fatal.
@@ -204,7 +204,7 @@ pub async fn download_url(
 
 /// Download a URL to a file path using parallel range requests with progress.
 ///
-/// * `threads` auto-scales from 4, doubling every 2 seconds while throughput
+/// * `threads` auto-scales from 4, adding 50% every second while throughput
 ///   improves, when `None`.
 /// * `user_agent` defaults to `ripget/<version>` when `None`.
 /// * Retries network failures with exponential backoff; 404/500 errors are fatal.
@@ -328,7 +328,9 @@ pub async fn download_url_with_progress(
                         }
 
                         if should_add {
-                            let next_threads = current_threads.saturating_mul(2).min(max_threads);
+                            let increment = cmp::max(1, current_threads / 2);
+                            let next_threads =
+                                current_threads.saturating_add(increment).min(max_threads);
                             if next_threads > current_threads && queue.has_remaining() {
                                 let to_spawn = next_threads - current_threads;
                                 spawn_workers(
