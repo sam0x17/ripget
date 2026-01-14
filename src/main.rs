@@ -11,7 +11,7 @@ use std::io::IsTerminal;
 #[derive(Debug, Parser)]
 #[command(name = "ripget", version, about = "Fast, multi-part downloader")]
 struct Args {
-    /// URL to download.
+    /// URL to download (or bucket/key path when using S3 credentials).
     #[arg(value_name = "URL")]
     url: String,
 
@@ -34,6 +34,26 @@ struct Args {
     /// Override the read buffer size, e.g. 8mb or 16777216.
     #[arg(long = "cache-size", value_name = "SIZE")]
     cache_size: Option<String>,
+
+    /// S3/R2 access key ID for authenticated downloads.
+    #[cfg(feature = "s3-auth")]
+    #[arg(long = "access-key", value_name = "KEY", env = "RIPGET_ACCESS_KEY")]
+    access_key: Option<String>,
+
+    /// S3/R2 secret access key for authenticated downloads.
+    #[cfg(feature = "s3-auth")]
+    #[arg(long = "secret-key", value_name = "KEY", env = "RIPGET_SECRET_KEY")]
+    secret_key: Option<String>,
+
+    /// S3-compatible endpoint URL (e.g., https://account.r2.cloudflarestorage.com).
+    #[cfg(feature = "s3-auth")]
+    #[arg(long = "endpoint", value_name = "URL", env = "RIPGET_ENDPOINT")]
+    endpoint: Option<String>,
+
+    /// AWS region (default: auto for R2).
+    #[cfg(feature = "s3-auth")]
+    #[arg(long = "region", value_name = "REGION", env = "RIPGET_REGION")]
+    region: Option<String>,
 }
 
 #[tokio::main]
@@ -100,15 +120,58 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .as_ref()
         .map(|handle| handle.clone() as ripget::Progress);
 
-    ripget::download_url_with_progress(
-        &args.url,
-        &output,
-        threads,
-        user_agent.as_deref(),
-        progress,
-        cache_size,
-    )
-    .await?;
+    #[cfg(feature = "s3-auth")]
+    {
+        // Check if S3 credentials are provided
+        if let (Some(access_key), Some(secret_key), Some(endpoint)) =
+            (&args.access_key, &args.secret_key, &args.endpoint)
+        {
+            let credentials = ripget::S3Credentials::with_region(
+                access_key,
+                secret_key,
+                endpoint,
+                args.region.as_deref().unwrap_or("auto"),
+            );
+            ripget::download_url_with_s3_auth(
+                &args.url,
+                &output,
+                &credentials,
+                threads,
+                progress,
+                cache_size,
+            )
+            .await?;
+        } else if args.access_key.is_some()
+            || args.secret_key.is_some()
+            || args.endpoint.is_some()
+        {
+            return Err("S3 auth requires --access-key, --secret-key, and --endpoint".into());
+        } else {
+            ripget::download_url_with_progress(
+                &args.url,
+                &output,
+                threads,
+                user_agent.as_deref(),
+                progress,
+                cache_size,
+            )
+            .await?;
+        }
+    }
+
+    #[cfg(not(feature = "s3-auth"))]
+    {
+        ripget::download_url_with_progress(
+            &args.url,
+            &output,
+            threads,
+            user_agent.as_deref(),
+            progress,
+            cache_size,
+        )
+        .await?;
+    }
+
     if let Some(handle) = progress_handle {
         handle.finish("done");
     }

@@ -1,0 +1,16 @@
+[package]
+name = "ripget-py"
+version = "0.1.0"
+edition = "2024"
+description = "Python bindings for ripget - fast multi-part downloader with S3/R2 support"
+license = "MIT OR Apache-2.0"
+
+[lib]
+name = "ripget_py"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.23", features = ["extension-module"] }
+pyo3-async-runtimes = { version = "0.23", features = ["tokio-runtime"] }
+tokio = { version = "1", features = ["rt-multi-thread"] }
+ripget = { path = "..", features = ["s3-auth"] }

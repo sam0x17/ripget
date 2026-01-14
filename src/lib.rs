@@ -19,14 +19,27 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+#[cfg(feature = "s3-auth")]
+use std::time::SystemTime;
+
 use futures_util::TryStreamExt;
 use reqwest::header::{ACCEPT_ENCODING, CONTENT_RANGE, HeaderMap, HeaderValue, RANGE, RETRY_AFTER};
-use reqwest::{Client, StatusCode};
+use reqwest::StatusCode;
+pub use reqwest::Client;
 use tokio::fs::OpenOptions;
 use tokio::io::{self, AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWriteExt, SeekFrom};
 use tokio::task::JoinSet;
 use tokio::time::{sleep, timeout};
 use tokio_util::io::StreamReader;
+
+#[cfg(feature = "s3-auth")]
+use aws_credential_types::Credentials as AwsCredentials;
+#[cfg(feature = "s3-auth")]
+use aws_sigv4::http_request::{sign, SignableBody, SignableRequest, SigningSettings};
+#[cfg(feature = "s3-auth")]
+use aws_sigv4::sign::v4;
+#[cfg(feature = "s3-auth")]
+use reqwest::header::HeaderName;
 
 /// Default number of parallel ranges used by ripget.
 pub const DEFAULT_THREADS: usize = 10;
@@ -61,6 +74,10 @@ pub enum RipgetError {
     UnexpectedEof { expected: u64, got: u64 },
     #[error("task failed: {0}")]
     JoinError(String),
+    #[error("invalid URL: {0}")]
+    InvalidUrl(String),
+    #[error("signing error: {0}")]
+    Signing(String),
     #[error(transparent)]
     Io(#[from] io::Error),
     #[error(transparent)]
@@ -78,6 +95,61 @@ pub struct DownloadReport {
     pub bytes: u64,
     /// Number of parallel ranges used.
     pub threads: usize,
+}
+
+/// Credentials for S3-compatible storage (R2, S3, MinIO, etc.)
+///
+/// # Example
+/// ```
+/// use ripget::S3Credentials;
+///
+/// let creds = S3Credentials::new(
+///     "access_key_id",
+///     "secret_access_key",
+///     "https://account.r2.cloudflarestorage.com",
+/// );
+/// ```
+#[derive(Debug, Clone)]
+pub struct S3Credentials {
+    /// AWS/S3 access key ID.
+    pub access_key_id: String,
+    /// AWS/S3 secret access key.
+    pub secret_access_key: String,
+    /// S3-compatible endpoint URL (e.g., `https://account.r2.cloudflarestorage.com`).
+    pub endpoint: String,
+    /// AWS region. Defaults to "auto" for R2.
+    pub region: String,
+}
+
+impl S3Credentials {
+    /// Create new S3 credentials with the default region ("auto").
+    pub fn new(
+        access_key_id: impl Into<String>,
+        secret_access_key: impl Into<String>,
+        endpoint: impl Into<String>,
+    ) -> Self {
+        Self {
+            access_key_id: access_key_id.into(),
+            secret_access_key: secret_access_key.into(),
+            endpoint: endpoint.into(),
+            region: "auto".to_string(),
+        }
+    }
+
+    /// Create new S3 credentials with a custom region.
+    pub fn with_region(
+        access_key_id: impl Into<String>,
+        secret_access_key: impl Into<String>,
+        endpoint: impl Into<String>,
+        region: impl Into<String>,
+    ) -> Self {
+        Self {
+            access_key_id: access_key_id.into(),
+            secret_access_key: secret_access_key.into(),
+            endpoint: endpoint.into(),
+            region: region.into(),
+        }
+    }
 }
 
 /// Reports download progress for integrations like CLI progress bars.
@@ -199,6 +271,204 @@ pub async fn download_url_with_progress(
     })
 }
 
+/// Download a URL using a pre-configured HTTP client.
+///
+/// This allows injecting a custom `reqwest::Client` with middleware (e.g., AWS SigV4 signing).
+///
+/// * `threads` defaults to 10 when `None`.
+/// * `buffer_size` defaults to 16MB when `None`.
+/// * Existing files at `dest` are truncated and overwritten.
+pub async fn download_url_with_client(
+    client: Client,
+    url: impl AsRef<str>,
+    dest: impl AsRef<Path>,
+    threads: Option<usize>,
+    progress: Option<Progress>,
+    buffer_size: Option<usize>,
+) -> Result<DownloadReport> {
+    let url = url.as_ref();
+    let dest = dest.as_ref().to_path_buf();
+    let requested_threads = normalize_threads(threads)?;
+    let buffer_size = normalize_buffer_size(buffer_size)?;
+    let metadata = fetch_metadata(&client, url).await?;
+    progress_init(&progress, metadata.len);
+    if metadata.len == 0 {
+        prepare_file(&dest, 0).await?;
+        progress_set_threads(&progress, 0);
+        return Ok(DownloadReport {
+            url: Some(url.to_string()),
+            path: dest,
+            bytes: 0,
+            threads: 0,
+        });
+    }
+
+    prepare_file(&dest, metadata.len).await?;
+
+    let threads = clamp_threads(requested_threads, metadata.len);
+    progress_set_threads(&progress, threads);
+    let ranges = split_ranges(metadata.len, threads);
+
+    let mut join_set = JoinSet::new();
+    for range in ranges {
+        let client = client.clone();
+        let url = url.to_string();
+        let dest = dest.clone();
+        let progress = progress.clone();
+        let allow_full_body = threads == 1;
+        join_set.spawn(async move {
+            download_range(
+                &client,
+                &url,
+                &dest,
+                range,
+                progress,
+                buffer_size,
+                allow_full_body,
+            )
+            .await
+        });
+    }
+
+    while let Some(result) = join_set.join_next().await {
+        match result {
+            Ok(inner) => inner?,
+            Err(err) => return Err(RipgetError::JoinError(err.to_string())),
+        }
+    }
+
+    Ok(DownloadReport {
+        url: Some(url.to_string()),
+        path: dest,
+        bytes: metadata.len,
+        threads,
+    })
+}
+
+/// Download a URL with S3-compatible authentication.
+///
+/// This function signs requests using AWS Signature V4, compatible with:
+/// - Cloudflare R2
+/// - Amazon S3
+/// - MinIO
+/// - Other S3-compatible storage
+///
+/// The URL can be:
+/// - A full URL: `https://account.r2.cloudflarestorage.com/bucket/key`
+/// - A bucket/key path: `bucket/key` (endpoint from credentials will be prepended)
+///
+/// # Example
+/// ```no_run
+/// # #[tokio::main]
+/// # async fn main() -> Result<(), ripget::RipgetError> {
+/// use ripget::{S3Credentials, download_url_with_s3_auth};
+///
+/// let creds = S3Credentials::new(
+///     "access_key_id",
+///     "secret_access_key",
+///     "https://account.r2.cloudflarestorage.com",
+/// );
+///
+/// let report = download_url_with_s3_auth(
+///     "my-bucket/path/to/file.bin",
+///     "output.bin",
+///     &creds,
+///     None,
+///     None,
+///     None,
+/// ).await?;
+/// # Ok(())
+/// # }
+/// ```
+#[cfg(feature = "s3-auth")]
+pub async fn download_url_with_s3_auth(
+    url: impl AsRef<str>,
+    dest: impl AsRef<Path>,
+    credentials: &S3Credentials,
+    threads: Option<usize>,
+    progress: Option<Progress>,
+    buffer_size: Option<usize>,
+) -> Result<DownloadReport> {
+    let url = url.as_ref();
+
+    // Build full URL if only bucket/key provided
+    let full_url = if url.starts_with("http://") || url.starts_with("https://") {
+        url.to_string()
+    } else {
+        format!("{}/{}", credentials.endpoint.trim_end_matches('/'), url)
+    };
+
+    // Build a signed client
+    let client = build_s3_signed_client(&full_url, credentials)?;
+
+    download_url_with_client(client, &full_url, dest, threads, progress, buffer_size).await
+}
+
+/// Build a reqwest client with AWS SigV4 signed headers for S3-compatible storage.
+#[cfg(feature = "s3-auth")]
+fn build_s3_signed_client(url: &str, credentials: &S3Credentials) -> Result<Client> {
+    let parsed_url =
+        reqwest::Url::parse(url).map_err(|e| RipgetError::InvalidUrl(e.to_string()))?;
+
+    let host = parsed_url
+        .host_str()
+        .ok_or_else(|| RipgetError::InvalidUrl("URL missing host".to_string()))?;
+
+    // Create AWS credentials
+    let aws_creds = AwsCredentials::new(
+        &credentials.access_key_id,
+        &credentials.secret_access_key,
+        None, // session token
+        None, // expiry
+        "ripget",
+    );
+
+    // Build signing params
+    let identity = aws_creds.into();
+    let signing_params = v4::SigningParams::builder()
+        .identity(&identity)
+        .region(&credentials.region)
+        .name("s3")
+        .time(SystemTime::now())
+        .settings(SigningSettings::default())
+        .build()
+        .map_err(|e| RipgetError::Signing(e.to_string()))?;
+
+    // Create a signable request for GET
+    let signable_request = SignableRequest::new(
+        "GET",
+        url,
+        std::iter::once(("host", host)),
+        SignableBody::empty(),
+    )
+    .map_err(|e| RipgetError::Signing(e.to_string()))?;
+
+    // Sign the request
+    let (signing_instructions, _signature) = sign(signable_request, &signing_params.into())
+        .map_err(|e| RipgetError::Signing(e.to_string()))?
+        .into_parts();
+
+    // Build headers with signature
+    let mut headers = HeaderMap::new();
+    headers.insert(ACCEPT_ENCODING, HeaderValue::from_static("identity"));
+
+    for (name, value) in signing_instructions.headers() {
+        let name_str: &str = name.as_ref();
+        let header_name = HeaderName::from_bytes(name_str.as_bytes())
+            .map_err(|e| RipgetError::Signing(format!("Invalid header name: {}", e)))?;
+        let header_value = HeaderValue::from_str(value)
+            .map_err(|e| RipgetError::Signing(format!("Invalid header value: {}", e)))?;
+        headers.insert(header_name, header_value);
+    }
+
+    // Build the client with signed headers
+    Client::builder()
+        .default_headers(headers)
+        .user_agent(default_user_agent())
+        .build()
+        .map_err(RipgetError::Http)
+}
+
 /// Copy an async reader into a file path.
 ///
 /// This uses a single range and requires the expected length up front.
@@ -318,7 +588,10 @@ fn default_user_agent() -> String {
     format!("ripget/{}", env!("CARGO_PKG_VERSION"))
 }
 
-fn build_client(user_agent: Option<&str>) -> Result<Client> {
+/// Build a reqwest client with default headers for ripget.
+///
+/// Use this as a base for custom clients that need additional configuration.
+pub fn build_client(user_agent: Option<&str>) -> Result<Client> {
     let mut headers = HeaderMap::new();
     headers.insert(ACCEPT_ENCODING, HeaderValue::from_static("identity"));
     let agent = user_agent
