@@ -21,5 +21,5 @@ tokio = { version = "1", features = ["fs", "io-util", "macros", "rt-multi-thread
 tokio-util = { version = "0", features = ["io"] }
 
 [dev-dependencies]
-hyper = { version = "0.14", features = ["full"] }
+hyper = { version = "0", features = ["full"] }
 tempfile = "3"
