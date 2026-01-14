@@ -4,7 +4,7 @@ use std::time::Duration;
 use std::{env, io};
 
 use clap::Parser;
-use indicatif::{ProgressBar, ProgressStyle};
+use indicatif::{ProgressBar, ProgressStyle, ProgressState};
 use std::io::IsTerminal;
 
 #[derive(Debug, Parser)]
@@ -69,8 +69,19 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let progress_handle = if !args.silent && io::stderr().is_terminal() {
         let bar = ProgressBar::new(0);
         let style = ProgressStyle::with_template(
-            "{spinner:.green} {msg} [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({bytes_per_sec}, ETA {eta})",
+            "{spinner:.green} {msg} [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({speed}, ETA {eta})",
         )?
+        .with_key("speed", |state: &ProgressState, w: &mut dyn std::fmt::Write| {
+            let bits_per_sec = state.per_sec() * 8.0;
+            let mbps = bits_per_sec / 1_000_000.0;
+            if !mbps.is_finite() || mbps <= 0.0 {
+                let _ = w.write_str("0 Mb/s");
+            } else if mbps >= 1000.0 {
+                let _ = write!(w, "{:.2} Gb/s", mbps / 1000.0);
+            } else {
+                let _ = write!(w, "{:.2} Mb/s", mbps);
+            }
+        })
         .progress_chars("=>-");
         bar.set_style(style);
         bar.set_message(output.display().to_string());
