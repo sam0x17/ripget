@@ -254,8 +254,18 @@ pub async fn download_url_with_progress(
                 let dest = dest.clone();
                 let progress = progress.clone();
                 let buffer_size = buffer_size;
+                let allow_full_body = threads == 1;
                 join_set.spawn(async move {
-                    download_range(&client, &url, &dest, range, progress, buffer_size).await
+                    download_range(
+                        &client,
+                        &url,
+                        &dest,
+                        range,
+                        progress,
+                        buffer_size,
+                        allow_full_body,
+                    )
+                    .await
                 });
             }
 
@@ -625,7 +635,16 @@ async fn download_worker(
             Some(range) => range,
             None => return Ok(()),
         };
-        download_range(&client, &url, &path, range, progress.clone(), buffer_size).await?;
+        download_range(
+            &client,
+            &url,
+            &path,
+            range,
+            progress.clone(),
+            buffer_size,
+            false,
+        )
+        .await?;
     }
 }
 
@@ -636,6 +655,7 @@ async fn download_range(
     range: Range,
     progress: Option<Progress>,
     buffer_size: usize,
+    allow_full_body: bool,
 ) -> Result<()> {
     let mut offset = range.start;
 
@@ -670,10 +690,18 @@ async fn download_range(
             });
         }
         if status != StatusCode::PARTIAL_CONTENT {
-            let retry_after = retry_after_delay(response.headers());
-            sleep_with_backoff(attempt, retry_after).await;
-            attempt = attempt.saturating_add(1);
-            continue;
+            if status == StatusCode::OK
+                && allow_full_body
+                && offset == range.start
+                && range.start == 0
+            {
+                // Server ignored the range header for the full-file request.
+            } else {
+                let retry_after = retry_after_delay(response.headers());
+                sleep_with_backoff(attempt, retry_after).await;
+                attempt = attempt.saturating_add(1);
+                continue;
+            }
         }
 
         let stream = response.bytes_stream().map_err(|err| io::Error::other(err));
