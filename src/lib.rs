@@ -1,18 +1,15 @@
 //! Fast, multi-part downloads with a simple API.
 //!
 //! ripget prioritizes speed by downloading large files in parallel with HTTP
-//! range requests.
+//! range requests and auto-tuning parallelism when a thread count is not
+//! specified.
 //!
 //! # Example
 //! ```no_run
 //! # #[tokio::main]
 //! # async fn main() -> Result<(), ripget::RipgetError> {
-//! let report = ripget::download_url(
-//!     "https://example.com/large.bin",
-//!     "large.bin",
-//!     Some(16),
-//!     None,
-//! ).await?;
+//! let report = ripget::download_url("https://example.com/large.bin", "large.bin", None, None)
+//!     .await?;
 //! println!("downloaded {} bytes to {:?}", report.bytes, report.path);
 //! # Ok(())
 //! # }
@@ -21,6 +18,7 @@
 use std::cmp;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use futures_util::TryStreamExt;
@@ -32,12 +30,15 @@ use tokio::task::JoinSet;
 use tokio::time::{sleep, timeout};
 use tokio_util::io::StreamReader;
 
-/// Default number of parallel ranges used by ripget.
-pub const DEFAULT_THREADS: usize = 16;
+/// Default starting thread count for the adaptive scheduler.
+pub const DEFAULT_THREADS: usize = 4;
 
 /// Fixed read buffer size used for streaming data.
 pub const BUFFER_SIZE: usize = 16 * 1024 * 1024;
 
+const AUTO_THREAD_STEP: usize = 4;
+const AUTO_THREAD_INTERVAL: Duration = Duration::from_millis(500);
+const AUTO_CHUNK_MULTIPLIER: u64 = 4;
 const READ_IDLE_TIMEOUT: Duration = Duration::from_secs(15);
 const RETRY_BASE_DELAY_MS: u64 = 1_000;
 const RETRY_MAX_DELAY_MS: u64 = 30_000;
@@ -90,15 +91,91 @@ pub trait ProgressReporter: Send + Sync {
     fn init(&self, total: u64);
     /// Adds downloaded bytes to the progress total.
     fn add(&self, delta: u64);
+    /// Updates the active thread count.
+    fn set_threads(&self, _threads: usize) {}
 }
 
 /// Shared progress reporter handle.
 pub type Progress = Arc<dyn ProgressReporter>;
 
+struct ProgressTracker {
+    inner: Option<Progress>,
+    downloaded: AtomicU64,
+}
+
+impl ProgressTracker {
+    fn new(inner: Option<Progress>) -> Self {
+        Self {
+            inner,
+            downloaded: AtomicU64::new(0),
+        }
+    }
+
+    fn downloaded(&self) -> u64 {
+        self.downloaded.load(Ordering::Relaxed)
+    }
+}
+
+impl ProgressReporter for ProgressTracker {
+    fn init(&self, total: u64) {
+        if let Some(inner) = &self.inner {
+            inner.init(total);
+        }
+    }
+
+    fn add(&self, delta: u64) {
+        if delta == 0 {
+            return;
+        }
+        self.downloaded.fetch_add(delta, Ordering::Relaxed);
+        if let Some(inner) = &self.inner {
+            inner.add(delta);
+        }
+    }
+
+    fn set_threads(&self, threads: usize) {
+        if let Some(inner) = &self.inner {
+            inner.set_threads(threads);
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct Range {
     start: u64,
     end: u64,
+}
+
+#[derive(Debug)]
+struct RangeQueue {
+    next: AtomicU64,
+    total: u64,
+    chunk_size: u64,
+}
+
+impl RangeQueue {
+    fn new(total: u64, chunk_size: u64) -> Self {
+        Self {
+            next: AtomicU64::new(0),
+            total,
+            chunk_size,
+        }
+    }
+
+    fn next_range(&self) -> Option<Range> {
+        let start = self.next.fetch_add(self.chunk_size, Ordering::Relaxed);
+        if start >= self.total {
+            return None;
+        }
+        let end = start
+            .saturating_add(self.chunk_size.saturating_sub(1))
+            .min(self.total.saturating_sub(1));
+        Some(Range { start, end })
+    }
+
+    fn has_remaining(&self) -> bool {
+        self.next.load(Ordering::Relaxed) < self.total
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -108,7 +185,8 @@ struct RemoteMetadata {
 
 /// Download a URL to a file path using parallel range requests.
 ///
-/// * `threads` defaults to 16 when `None`.
+/// * `threads` auto-scales from 4, adding 4 every 500ms while throughput
+///   improves, when `None`.
 /// * `user_agent` defaults to `ripget/<version>` when `None`.
 /// * Retries network failures with exponential backoff; 404/500 errors are fatal.
 /// * Range reads that stall for 15 seconds reconnect automatically.
@@ -127,7 +205,8 @@ pub async fn download_url(
 
 /// Download a URL to a file path using parallel range requests with progress.
 ///
-/// * `threads` defaults to 16 when `None`.
+/// * `threads` auto-scales from 4, adding 4 every 500ms while throughput
+///   improves, when `None`.
 /// * `user_agent` defaults to `ripget/<version>` when `None`.
 /// * Retries network failures with exponential backoff; 404/500 errors are fatal.
 /// * Range reads that stall for 15 seconds reconnect automatically.
@@ -143,13 +222,15 @@ pub async fn download_url_with_progress(
 ) -> Result<DownloadReport> {
     let url = url.as_ref();
     let dest = dest.as_ref().to_path_buf();
-    let requested_threads = normalize_threads(threads)?;
     let buffer_size = normalize_buffer_size(buffer_size)?;
     let client = build_client(user_agent)?;
     let metadata = fetch_metadata(&client, url).await?;
+    let tracker = Arc::new(ProgressTracker::new(progress));
+    let progress: Option<Progress> = Some(tracker.clone());
     progress_init(&progress, metadata.len);
     if metadata.len == 0 {
         prepare_file(&dest, 0).await?;
+        progress_set_threads(&progress, 0);
         return Ok(DownloadReport {
             url: Some(url.to_string()),
             path: dest,
@@ -160,34 +241,137 @@ pub async fn download_url_with_progress(
 
     prepare_file(&dest, metadata.len).await?;
 
-    let threads = clamp_threads(requested_threads, metadata.len);
-    let ranges = split_ranges(metadata.len, threads);
+    match threads {
+        Some(value) => {
+            let requested_threads = normalize_threads(value)?;
+            let threads = clamp_threads(requested_threads, metadata.len);
+            progress_set_threads(&progress, threads);
+            let ranges = split_ranges(metadata.len, threads);
 
-    let mut join_set = JoinSet::new();
-    for range in ranges {
-        let client = client.clone();
-        let url = url.to_string();
-        let dest = dest.clone();
-        let progress = progress.clone();
-        let buffer_size = buffer_size;
-        join_set.spawn(async move {
-            download_range(&client, &url, &dest, range, progress, buffer_size).await
-        });
-    }
+            let mut join_set = JoinSet::new();
+            for range in ranges {
+                let client = client.clone();
+                let url = url.to_string();
+                let dest = dest.clone();
+                let progress = progress.clone();
+                let buffer_size = buffer_size;
+                join_set.spawn(async move {
+                    download_range(&client, &url, &dest, range, progress, buffer_size).await
+                });
+            }
 
-    while let Some(result) = join_set.join_next().await {
-        match result {
-            Ok(inner) => inner?,
-            Err(err) => return Err(RipgetError::JoinError(err.to_string())),
+            while let Some(result) = join_set.join_next().await {
+                match result {
+                    Ok(inner) => inner?,
+                    Err(err) => return Err(RipgetError::JoinError(err.to_string())),
+                }
+            }
+
+            Ok(DownloadReport {
+                url: Some(url.to_string()),
+                path: dest,
+                bytes: metadata.len,
+                threads,
+            })
+        }
+        None => {
+            let chunk_size = auto_chunk_size(buffer_size, metadata.len);
+            let queue = Arc::new(RangeQueue::new(metadata.len, chunk_size));
+            let max_threads = max_parallel_chunks(metadata.len, chunk_size);
+            let mut current_threads = cmp::min(DEFAULT_THREADS, max_threads);
+            if current_threads == 0 {
+                current_threads = 1;
+            }
+            progress_set_threads(&progress, current_threads);
+
+            let mut join_set = JoinSet::new();
+            let mut active_workers = 0usize;
+            spawn_workers(
+                &mut join_set,
+                current_threads,
+                &client,
+                url,
+                &dest,
+                &queue,
+                &progress,
+                buffer_size,
+            );
+            active_workers += current_threads;
+
+            let mut baseline_speed: Option<u64> = None;
+            let mut last_bytes = tracker.downloaded();
+            let mut scaling = true;
+            let mut ticker = tokio::time::interval(AUTO_THREAD_INTERVAL);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            ticker.tick().await;
+
+            loop {
+                tokio::select! {
+                    _ = ticker.tick(), if scaling => {
+                        let now_bytes = tracker.downloaded();
+                        let speed = now_bytes.saturating_sub(last_bytes);
+                        last_bytes = now_bytes;
+
+                        let mut should_add = false;
+                        match baseline_speed {
+                            None => {
+                                baseline_speed = Some(speed);
+                                should_add = true;
+                            }
+                            Some(prev) => {
+                                if speed > prev {
+                                    baseline_speed = Some(speed);
+                                    should_add = true;
+                                } else {
+                                    scaling = false;
+                                }
+                            }
+                        }
+
+                        if should_add {
+                            let next_threads = (current_threads + AUTO_THREAD_STEP).min(max_threads);
+                            if next_threads > current_threads && queue.has_remaining() {
+                                let to_spawn = next_threads - current_threads;
+                                spawn_workers(
+                                    &mut join_set,
+                                    to_spawn,
+                                    &client,
+                                    url,
+                                    &dest,
+                                    &queue,
+                                    &progress,
+                                    buffer_size,
+                                );
+                                active_workers += to_spawn;
+                                current_threads = next_threads;
+                                progress_set_threads(&progress, current_threads);
+                            } else {
+                                scaling = false;
+                            }
+                        }
+                    }
+                    Some(result) = join_set.join_next(), if active_workers > 0 => {
+                        active_workers = active_workers.saturating_sub(1);
+                        match result {
+                            Ok(inner) => inner?,
+                            Err(err) => return Err(RipgetError::JoinError(err.to_string())),
+                        }
+                    }
+                }
+
+                if active_workers == 0 {
+                    break;
+                }
+            }
+
+            Ok(DownloadReport {
+                url: Some(url.to_string()),
+                path: dest,
+                bytes: metadata.len,
+                threads: current_threads,
+            })
         }
     }
-
-    Ok(DownloadReport {
-        url: Some(url.to_string()),
-        path: dest,
-        bytes: metadata.len,
-        threads,
-    })
 }
 
 /// Copy an async reader into a file path.
@@ -225,6 +409,7 @@ where
     let dest = dest.as_ref().to_path_buf();
     let buffer_size = normalize_buffer_size(buffer_size)?;
     progress_init(&progress, expected_len);
+    progress_set_threads(&progress, 1);
     if expected_len == 0 {
         prepare_file(&dest, 0).await?;
         return Ok(DownloadReport {
@@ -261,8 +446,7 @@ where
     })
 }
 
-fn normalize_threads(threads: Option<usize>) -> Result<usize> {
-    let threads = threads.unwrap_or(DEFAULT_THREADS);
+fn normalize_threads(threads: usize) -> Result<usize> {
     if threads == 0 {
         return Err(RipgetError::InvalidThreadCount(threads));
     }
@@ -302,6 +486,22 @@ fn split_ranges(total_len: u64, threads: usize) -> Vec<Range> {
         start = end + 1;
     }
     ranges
+}
+
+fn auto_chunk_size(buffer_size: usize, total_len: u64) -> u64 {
+    let base = buffer_size as u64;
+    let chunk = base.saturating_mul(AUTO_CHUNK_MULTIPLIER);
+    let chunk = cmp::max(base, chunk);
+    cmp::min(chunk, total_len)
+}
+
+fn max_parallel_chunks(total_len: u64, chunk_size: u64) -> usize {
+    if total_len == 0 {
+        return 0;
+    }
+    let chunk_size = cmp::max(1, chunk_size);
+    let chunks = (total_len + chunk_size - 1) / chunk_size;
+    cmp::max(1, chunks) as usize
 }
 
 fn default_user_agent() -> String {
@@ -387,6 +587,45 @@ async fn prepare_file(path: &Path, size: u64) -> Result<()> {
         .await?;
     file.set_len(size).await?;
     Ok(())
+}
+
+fn spawn_workers(
+    join_set: &mut JoinSet<Result<()>>,
+    count: usize,
+    client: &Client,
+    url: &str,
+    path: &PathBuf,
+    queue: &Arc<RangeQueue>,
+    progress: &Option<Progress>,
+    buffer_size: usize,
+) {
+    for _ in 0..count {
+        let client = client.clone();
+        let url = url.to_string();
+        let path = path.clone();
+        let queue = queue.clone();
+        let progress = progress.clone();
+        join_set.spawn(async move {
+            download_worker(client, url, path, queue, progress, buffer_size).await
+        });
+    }
+}
+
+async fn download_worker(
+    client: Client,
+    url: String,
+    path: PathBuf,
+    queue: Arc<RangeQueue>,
+    progress: Option<Progress>,
+    buffer_size: usize,
+) -> Result<()> {
+    loop {
+        let range = match queue.next_range() {
+            Some(range) => range,
+            None => return Ok(()),
+        };
+        download_range(&client, &url, &path, range, progress.clone(), buffer_size).await?;
+    }
 }
 
 async fn download_range(
@@ -532,6 +771,12 @@ async fn read_fully_with_timeout<R: AsyncRead + Unpin>(
 fn progress_init(progress: &Option<Progress>, total: u64) {
     if let Some(progress) = progress {
         progress.init(total);
+    }
+}
+
+fn progress_set_threads(progress: &Option<Progress>, threads: usize) {
+    if let Some(progress) = progress {
+        progress.set_threads(threads);
     }
 }
 

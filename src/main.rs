@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use std::{env, io};
 
@@ -8,11 +9,7 @@ use indicatif::{ProgressBar, ProgressState, ProgressStyle};
 use std::io::IsTerminal;
 
 #[derive(Debug, Parser)]
-#[command(
-    name = "ripget",
-    version,
-    about = "Fast, idempotent, multi-part downloader"
-)]
+#[command(name = "ripget", version, about = "Fast, multi-part downloader")]
 struct Args {
     /// URL to download.
     #[arg(value_name = "URL")]
@@ -22,7 +19,7 @@ struct Args {
     #[arg(value_name = "OUTPUT")]
     output: Option<PathBuf>,
 
-    /// Override the number of parallel ranges.
+    /// Override the number of parallel ranges (auto-tuned when omitted).
     #[arg(long)]
     threads: Option<usize>,
 
@@ -65,12 +62,18 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         Some(value) => Some(parse_cache_size(&value)?),
         None => env_cache_size()?,
     };
+    let thread_count = Arc::new(AtomicUsize::new(threads.unwrap_or(ripget::DEFAULT_THREADS)));
 
     let progress_handle = if !args.silent && io::stderr().is_terminal() {
         let bar = ProgressBar::new(0);
+        let thread_count_style = thread_count.clone();
         let style = ProgressStyle::with_template(
-            "{spinner:.green} {msg} [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({speed}, ETA {eta})",
+            "{spinner:.green} {msg} [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({speed}, {threads}, ETA {eta})",
         )?
+        .with_key("threads", move |_state: &ProgressState, w: &mut dyn std::fmt::Write| {
+            let count = thread_count_style.load(Ordering::Relaxed);
+            let _ = write!(w, "{} threads", count);
+        })
         .with_key("speed", |state: &ProgressState, w: &mut dyn std::fmt::Write| {
             let bits_per_sec = state.per_sec() * 8.0;
             let mbps = bits_per_sec / 1_000_000.0;
@@ -86,7 +89,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         bar.set_style(style);
         bar.set_message(output.display().to_string());
         bar.enable_steady_tick(Duration::from_millis(120));
-        Some(Arc::new(CliProgress { bar }))
+        Some(Arc::new(CliProgress {
+            bar,
+            threads: thread_count.clone(),
+        }))
     } else {
         None
     };
@@ -136,6 +142,7 @@ fn env_threads() -> Result<Option<usize>, Box<dyn std::error::Error>> {
 
 struct CliProgress {
     bar: ProgressBar,
+    threads: Arc<AtomicUsize>,
 }
 
 impl CliProgress {
@@ -210,6 +217,10 @@ impl ripget::ProgressReporter for CliProgress {
 
     fn add(&self, delta: u64) {
         self.bar.inc(delta);
+    }
+
+    fn set_threads(&self, threads: usize) {
+        self.threads.store(threads, Ordering::Relaxed);
     }
 }
 
