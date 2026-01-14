@@ -6,7 +6,7 @@
 
 ripget is a fast downloader that uses parallel HTTP range requests to pull
 large files as quickly as possible. The default configuration auto-tunes
-parallelism (starting at 4 threads and adding 50% every second while throughput
+parallelism (starting at 4 threads and adding 50% every 2 seconds while throughput
 improves) and uses 16MB buffers, similar in spirit to aria2c.
 
 ## Features
@@ -32,7 +32,7 @@ ripget "https://example.com/assets/large.bin"
 When run in an interactive terminal, ripget shows a progress bar on stderr.
 Use `--silent` to disable the progress bar.
 By default ripget auto-tunes concurrency (starting at 4 threads and adding 50%
-every second while throughput improves). Use `--threads` or `RIPGET_THREADS` to
+every 2 seconds while throughput improves). Use `--threads` or `RIPGET_THREADS` to
 force a fixed thread count.
 
 Override the buffer size:
