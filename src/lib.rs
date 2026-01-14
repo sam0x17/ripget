@@ -456,7 +456,7 @@ async fn download_range(
             }
         }
 
-        let stream = response.bytes_stream().map_err(|err| io::Error::other(err));
+        let stream = response.bytes_stream().map_err(io::Error::other);
         let mut reader = StreamReader::new(stream);
         let start_offset = offset;
         match write_range_from_reader(
