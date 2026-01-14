@@ -936,7 +936,6 @@ dependencies = [
  "futures-util",
  "hyper 0.14.32",
  "indicatif",
- "memchr",
  "reqwest",
  "tempfile",
  "thiserror 1.0.69",

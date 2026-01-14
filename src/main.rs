@@ -4,7 +4,7 @@ use std::time::Duration;
 use std::{env, io};
 
 use clap::Parser;
-use indicatif::{ProgressBar, ProgressStyle, ProgressState};
+use indicatif::{ProgressBar, ProgressState, ProgressStyle};
 use std::io::IsTerminal;
 
 #[derive(Debug, Parser)]

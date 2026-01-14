@@ -1,8 +1,7 @@
-//! Fast, idempotent, multi-part downloads with a simple API.
+//! Fast, multi-part downloads with a simple API.
 //!
 //! ripget prioritizes speed by downloading large files in parallel with HTTP
-//! range requests. It also supports idempotent resumes using baked-in marker
-//! bytes that are extremely unlikely to appear in real data.
+//! range requests.
 //!
 //! # Example
 //! ```no_run
@@ -25,7 +24,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::TryStreamExt;
-use memchr::memmem;
 use reqwest::header::{ACCEPT_ENCODING, CONTENT_RANGE, HeaderMap, HeaderValue, RANGE, RETRY_AFTER};
 use reqwest::{Client, StatusCode};
 use tokio::fs::OpenOptions;
@@ -40,24 +38,6 @@ pub const DEFAULT_THREADS: usize = 16;
 /// Fixed read buffer size used for streaming data.
 pub const BUFFER_SIZE: usize = 16 * 1024 * 1024;
 
-const MARKER_A: u128 = 0x0b933fa4efd1205406d7cce948d07562;
-const MARKER_B: u128 = 0xc229c46eda461eaf9e68fa9da89a29ba;
-
-const fn marker_bytes() -> [u8; 32] {
-    let a = MARKER_A.to_be_bytes();
-    let b = MARKER_B.to_be_bytes();
-    let mut out = [0u8; 32];
-    let mut i = 0;
-    while i < 16 {
-        out[i] = a[i];
-        out[i + 16] = b[i];
-        i += 1;
-    }
-    out
-}
-
-const MARKER_BYTES: [u8; 32] = marker_bytes();
-const MARKER_LEN: usize = 32;
 const READ_IDLE_TIMEOUT: Duration = Duration::from_secs(15);
 const RETRY_BASE_DELAY_MS: u64 = 1_000;
 const RETRY_MAX_DELAY_MS: u64 = 30_000;
@@ -81,8 +61,6 @@ pub enum RipgetError {
     RangeNotSupported(String),
     #[error("unexpected HTTP status {status} for {url}")]
     HttpStatus { status: StatusCode, url: String },
-    #[error("file size {found} does not match expected {expected}")]
-    FileSizeMismatch { expected: u64, found: u64 },
     #[error("unexpected end of stream after {got} bytes, expected {expected}")]
     UnexpectedEof { expected: u64, got: u64 },
     #[error("task failed: {0}")]
@@ -135,6 +113,7 @@ struct RemoteMetadata {
 /// * Retries network failures with exponential backoff; 404/500 errors are fatal.
 /// * Range reads that stall for 15 seconds reconnect automatically.
 /// * Buffer size defaults to 16MB.
+/// * Existing files at `dest` are truncated and overwritten.
 ///
 /// Use [`download_url_with_progress`] to receive progress callbacks.
 pub async fn download_url(
@@ -153,6 +132,7 @@ pub async fn download_url(
 /// * Retries network failures with exponential backoff; 404/500 errors are fatal.
 /// * Range reads that stall for 15 seconds reconnect automatically.
 /// * `buffer_size` defaults to 16MB when `None`.
+/// * Existing files at `dest` are truncated and overwritten.
 pub async fn download_url_with_progress(
     url: impl AsRef<str>,
     dest: impl AsRef<Path>,
@@ -178,7 +158,6 @@ pub async fn download_url_with_progress(
         });
     }
 
-    let preexisting = tokio::fs::metadata(&dest).await.is_ok();
     prepare_file(&dest, metadata.len).await?;
 
     let threads = clamp_threads(requested_threads, metadata.len);
@@ -192,16 +171,7 @@ pub async fn download_url_with_progress(
         let progress = progress.clone();
         let buffer_size = buffer_size;
         join_set.spawn(async move {
-            download_range(
-                &client,
-                &url,
-                &dest,
-                range,
-                preexisting,
-                progress,
-                buffer_size,
-            )
-            .await
+            download_range(&client, &url, &dest, range, progress, buffer_size).await
         });
     }
 
@@ -220,7 +190,7 @@ pub async fn download_url_with_progress(
     })
 }
 
-/// Copy an async reader into a file path while preserving idempotent markers.
+/// Copy an async reader into a file path.
 ///
 /// This uses a single range and requires the expected length up front.
 ///
@@ -236,11 +206,12 @@ where
     download_reader_with_progress(reader, dest, expected_len, None, None).await
 }
 
-/// Copy an async reader into a file path while preserving idempotent markers.
+/// Copy an async reader into a file path.
 ///
 /// This uses a single range and requires the expected length up front.
 ///
 /// * `buffer_size` defaults to 16MB when `None`.
+/// * Existing files at `dest` are truncated and overwritten.
 pub async fn download_reader_with_progress<R>(
     mut reader: R,
     dest: impl AsRef<Path>,
@@ -264,26 +235,13 @@ where
         });
     }
 
-    let preexisting = tokio::fs::metadata(&dest).await.is_ok();
     prepare_file(&dest, expected_len).await?;
 
     let range = Range {
         start: 0,
         end: expected_len - 1,
     };
-    let resume = resume_offset(&dest, range, preexisting, buffer_size).await?;
-    let Some(mut offset) = resume else {
-        progress_add(&progress, expected_len);
-        return Ok(DownloadReport {
-            url: None,
-            path: dest,
-            bytes: expected_len,
-            threads: 1,
-        });
-    };
-
-    progress_add(&progress, offset.saturating_sub(range.start));
-    skip_bytes(&mut reader, offset, buffer_size).await?;
+    let mut offset = range.start;
     write_range_from_reader(
         &mut reader,
         &dest,
@@ -427,16 +385,7 @@ async fn prepare_file(path: &Path, size: u64) -> Result<()> {
         .write(true)
         .open(path)
         .await?;
-    let len = file.metadata().await?.len();
-    if len > size {
-        return Err(RipgetError::FileSizeMismatch {
-            expected: size,
-            found: len,
-        });
-    }
-    if len < size {
-        file.set_len(size).await?;
-    }
+    file.set_len(size).await?;
     Ok(())
 }
 
@@ -445,17 +394,10 @@ async fn download_range(
     url: &str,
     path: &Path,
     range: Range,
-    preexisting: bool,
     progress: Option<Progress>,
     buffer_size: usize,
 ) -> Result<()> {
-    let range_len = range.end - range.start + 1;
-    let resume = resume_offset(path, range, preexisting, buffer_size).await?;
-    let Some(mut offset) = resume else {
-        progress_add(&progress, range_len);
-        return Ok(());
-    };
-    progress_add(&progress, offset.saturating_sub(range.start));
+    let mut offset = range.start;
 
     let mut attempt = 0usize;
     loop {
@@ -522,66 +464,6 @@ async fn download_range(
     }
 }
 
-async fn resume_offset(
-    path: &Path,
-    range: Range,
-    preexisting: bool,
-    buffer_size: usize,
-) -> Result<Option<u64>> {
-    if !preexisting {
-        return Ok(Some(range.start));
-    }
-    find_last_marker(path, range.start, range.end, buffer_size).await
-}
-
-async fn find_last_marker(
-    path: &Path,
-    start: u64,
-    end: u64,
-    buffer_size: usize,
-) -> Result<Option<u64>> {
-    let mut file = OpenOptions::new().read(true).open(path).await?;
-    file.seek(SeekFrom::Start(start)).await?;
-
-    let mut offset = start;
-    let mut carry: Vec<u8> = Vec::new();
-    let mut last_found: Option<u64> = None;
-    let finder = memmem::Finder::new(&MARKER_BYTES);
-
-    let mut buf = vec![0u8; buffer_size];
-    while offset <= end {
-        let remaining = (end - offset + 1) as usize;
-        let read_len = cmp::min(remaining, buffer_size);
-        let n = file.read(&mut buf[..read_len]).await?;
-        if n == 0 {
-            break;
-        }
-
-        let mut window = Vec::with_capacity(carry.len() + n);
-        window.extend_from_slice(&carry);
-        window.extend_from_slice(&buf[..n]);
-
-        for pos in finder.find_iter(&window) {
-            let absolute = offset.saturating_sub(carry.len() as u64) + pos as u64;
-            last_found = Some(absolute);
-        }
-
-        let keep = MARKER_LEN.saturating_sub(1);
-        if keep > 0 {
-            if window.len() >= keep {
-                carry.clear();
-                carry.extend_from_slice(&window[window.len() - keep..]);
-            } else {
-                carry = window;
-            }
-        }
-
-        offset += n as u64;
-    }
-
-    Ok(last_found)
-}
-
 async fn write_range_from_reader<R: AsyncRead + Unpin>(
     reader: &mut R,
     path: &Path,
@@ -608,38 +490,11 @@ async fn write_range_from_reader<R: AsyncRead + Unpin>(
         progress_add(progress, n as u64);
         *offset += n as u64;
         remaining -= n as u64;
-
-        if remaining > 0 && *offset + MARKER_LEN as u64 - 1 <= range.end {
-            file.seek(SeekFrom::Start(*offset)).await?;
-            file.write_all(&MARKER_BYTES).await?;
-        }
     }
 
     if remaining != 0 {
         let got = expected - remaining;
         return Err(RipgetError::UnexpectedEof { expected, got });
-    }
-    Ok(())
-}
-
-async fn skip_bytes<R: AsyncRead + Unpin>(
-    reader: &mut R,
-    mut to_skip: u64,
-    buffer_size: usize,
-) -> Result<()> {
-    if to_skip == 0 {
-        return Ok(());
-    }
-    let mut buf = vec![0u8; cmp::min(buffer_size, 64 * 1024)];
-    let expected = to_skip;
-    while to_skip > 0 {
-        let read_len = cmp::min(to_skip as usize, buf.len());
-        let n = reader.read(&mut buf[..read_len]).await?;
-        if n == 0 {
-            let got = expected - to_skip;
-            return Err(RipgetError::UnexpectedEof { expected, got });
-        }
-        to_skip -= n as u64;
     }
     Ok(())
 }
@@ -828,27 +683,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn find_last_marker_returns_last_offset() -> Result<()> {
-        let dir = tempdir()?;
-        let path = dir.path().join("marker.bin");
-        let mut file = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .open(&path)
-            .await?;
-        file.set_len(256).await?;
-        file.seek(SeekFrom::Start(10)).await?;
-        file.write_all(&MARKER_BYTES).await?;
-        file.seek(SeekFrom::Start(64)).await?;
-        file.write_all(&MARKER_BYTES).await?;
-
-        let found = find_last_marker(&path, 0, 255, 1024).await?;
-        assert_eq!(found, Some(64));
-        Ok(())
-    }
-
-    #[tokio::test]
     async fn download_url_completes() -> Result<()> {
         let data: Vec<u8> = (0..(1024 * 1024 * 2)).map(|i| (i % 251) as u8).collect();
         let (addr, shutdown) = spawn_range_server(Arc::new(data.clone())).await;
@@ -859,37 +693,6 @@ mod tests {
 
         let report = download_url(&url, &path, Some(4), None).await?;
         assert_eq!(report.bytes as usize, data.len());
-
-        let downloaded = tokio::fs::read(&path).await?;
-        assert_eq!(downloaded, data);
-        let _ = shutdown.send(());
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn download_url_resumes_from_marker() -> Result<()> {
-        let data: Vec<u8> = (0..(1024 * 1024 * 3)).map(|i| (i % 193) as u8).collect();
-        let (addr, shutdown) = spawn_range_server(Arc::new(data.clone())).await;
-
-        let dir = tempdir()?;
-        let path = dir.path().join("resume.bin");
-        let url = format!("http://{}/resume.bin", addr);
-
-        let mut file = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .open(&path)
-            .await?;
-        file.set_len(data.len() as u64).await?;
-        let resume_at = 1024 * 512;
-        file.seek(SeekFrom::Start(0)).await?;
-        file.write_all(&data[..resume_at]).await?;
-        file.seek(SeekFrom::Start(resume_at as u64)).await?;
-        file.write_all(&MARKER_BYTES).await?;
-        drop(file);
-
-        download_url(&url, &path, Some(1), None).await?;
 
         let downloaded = tokio::fs::read(&path).await?;
         assert_eq!(downloaded, data);

@@ -4,13 +4,13 @@
 [![Docs.rs](https://img.shields.io/docsrs/ripget.svg)](https://docs.rs/ripget)
 [![CI](https://github.com/sam0x17/ripget/actions/workflows/ci.yaml/badge.svg)](https://github.com/sam0x17/ripget/actions/workflows/ci.yaml)
 
-ripget is a fast, idempotent downloader that uses parallel HTTP range requests
-to pull large files as quickly as possible. The default configuration uses
-16 parallel ranges and 16MB buffers, similar in spirit to aria2c.
+ripget is a fast downloader that uses parallel HTTP range requests to pull
+large files as quickly as possible. The default configuration uses 16 parallel
+ranges and 16MB buffers, similar in spirit to aria2c.
 
 ## Features
 - Parallel range downloads with a preallocated file target
-- Idempotent resumes using baked-in u128 marker bytes
+- Overwrites existing output files by default
 - Interactive CLI progress bar in terminals
 - Automatic retry with exponential backoff for network throttling or disconnects
 - Per-range idle timeout reconnects after 15 seconds without data
@@ -86,13 +86,6 @@ println!("downloaded {} bytes", report.bytes);
 # }
 ```
 
-## Idempotent resume model
-ripget bakes two random u128 values into the binary and treats their byte
-sequence as a marker. Each write appends the marker at the end of the chunk,
-and the next write overwrites it. When resuming, ripget scans each range for
-the last marker and starts from that offset. If no marker is found for a
-preexisting file, the range is assumed complete.
-
 ## Retry behavior
 ripget retries network failures and most HTTP statuses with exponential
 backoff to handle throttling or transient outages. Only 404 and 500 responses
@@ -100,4 +93,3 @@ are treated as fatal. Each range reconnects if no data arrives for 15 seconds.
 
 ## Limitations
 - The server must support HTTP range requests and report the full size.
-- Very small files (smaller than the marker length) have limited resume value.
