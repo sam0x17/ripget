@@ -19,7 +19,7 @@ struct Args {
     #[arg(value_name = "OUTPUT")]
     output: Option<PathBuf>,
 
-    /// Override the number of parallel ranges (auto-tuned when omitted).
+    /// Override the number of parallel ranges.
     #[arg(long)]
     threads: Option<usize>,
 

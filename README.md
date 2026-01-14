@@ -5,9 +5,8 @@
 [![CI](https://github.com/sam0x17/ripget/actions/workflows/ci.yaml/badge.svg)](https://github.com/sam0x17/ripget/actions/workflows/ci.yaml)
 
 ripget is a fast downloader that uses parallel HTTP range requests to pull
-large files as quickly as possible. The default configuration auto-tunes
-parallelism (starting at 4 threads and adding 50% every 4 seconds while throughput
-improves) and uses 16MB buffers, similar in spirit to aria2c.
+large files as quickly as possible. The default configuration uses 10 parallel
+ranges and 16MB buffers, similar in spirit to aria2c.
 
 ## Features
 - Parallel range downloads with a preallocated file target
@@ -31,9 +30,7 @@ ripget "https://example.com/assets/large.bin"
 
 When run in an interactive terminal, ripget shows a progress bar on stderr.
 Use `--silent` to disable the progress bar.
-By default ripget auto-tunes concurrency (starting at 4 threads and adding 50%
-every 4 seconds while throughput improves). Use `--threads` or `RIPGET_THREADS` to
-force a fixed thread count.
+Use `--threads` or `RIPGET_THREADS` to override the default thread count.
 
 Override the buffer size:
 ```
@@ -46,12 +43,12 @@ ripget "https://example.com/assets/large.bin" my_file.blob
 ```
 
 ### Environment overrides
-- `RIPGET_THREADS`: override the auto-tuned parallel range count
+- `RIPGET_THREADS`: override the default parallel range count
 - `RIPGET_USER_AGENT`: override the HTTP user agent
 - `RIPGET_CACHE_SIZE`: override the read buffer size (e.g. `8mb`)
 
 ### CLI options
-- `--threads <N>`: override the auto-tuned parallel range count
+- `--threads <N>`: override the default parallel range count
 - `--user-agent <UA>`: override the HTTP user agent
 - `--silent`: disable the progress bar
 - `--cache-size <SIZE>`: override the read buffer size (e.g. `8mb`)
