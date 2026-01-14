@@ -9,7 +9,7 @@ large files as quickly as possible. The default configuration uses 10 parallel
 ranges and 16MB buffers, similar in spirit to aria2c.
 
 ## Features
-- Parallel range downloads with a preallocated file target
+- Download files as fast as possible using HTTP multiplexing
 - Overwrites existing output files by default
 - Interactive CLI progress bar in terminals
 - Automatic retry with exponential backoff for network throttling or disconnects
