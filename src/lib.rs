@@ -36,7 +36,7 @@ pub const DEFAULT_THREADS: usize = 4;
 /// Fixed read buffer size used for streaming data.
 pub const BUFFER_SIZE: usize = 16 * 1024 * 1024;
 
-const AUTO_THREAD_INTERVAL: Duration = Duration::from_secs(2);
+const AUTO_THREAD_INTERVAL: Duration = Duration::from_secs(4);
 const AUTO_CHUNK_MULTIPLIER: u64 = 4;
 const READ_IDLE_TIMEOUT: Duration = Duration::from_secs(15);
 const RETRY_BASE_DELAY_MS: u64 = 1_000;
@@ -184,7 +184,7 @@ struct RemoteMetadata {
 
 /// Download a URL to a file path using parallel range requests.
 ///
-/// * `threads` auto-scales from 4, adding 50% every 2 seconds while throughput
+/// * `threads` auto-scales from 4, adding 50% every 4 seconds while throughput
 ///   improves, when `None`.
 /// * `user_agent` defaults to `ripget/<version>` when `None`.
 /// * Retries network failures with exponential backoff; 404/500 errors are fatal.
@@ -204,7 +204,7 @@ pub async fn download_url(
 
 /// Download a URL to a file path using parallel range requests with progress.
 ///
-/// * `threads` auto-scales from 4, adding 50% every 2 seconds while throughput
+/// * `threads` auto-scales from 4, adding 50% every 4 seconds while throughput
 ///   improves, when `None`.
 /// * `user_agent` defaults to `ripget/<version>` when `None`.
 /// * Retries network failures with exponential backoff; 404/500 errors are fatal.
