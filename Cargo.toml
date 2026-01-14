@@ -11,14 +11,22 @@ keywords = ["download", "downloader", "http", "async", "cli"]
 categories = ["command-line-utilities", "network-programming"]
 license = "MIT OR Apache-2.0"
 
+[features]
+default = []
+s3-auth = ["dep:aws-sigv4", "dep:aws-credential-types"]
+
 [dependencies]
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 futures-util = "0"
 indicatif = "0"
 reqwest = { version = "0", default-features = false, features = ["rustls-tls", "stream"] }
 thiserror = "1"
 tokio = { version = "1", features = ["fs", "io-util", "macros", "rt-multi-thread", "sync", "time"] }
 tokio-util = { version = "0", features = ["io"] }
+
+# S3 authentication (optional)
+aws-sigv4 = { version = "1", optional = true }
+aws-credential-types = { version = "1", optional = true }
 
 [dev-dependencies]
 hyper = { version = "0", features = ["full"] }
