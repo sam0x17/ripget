@@ -12,14 +12,14 @@ categories = ["command-line-utilities", "network-programming"]
 license = "MIT OR Apache-2.0"
 
 [dependencies]
-clap = { version = "4.5", features = ["derive"] }
-futures-util = "0.3"
-indicatif = "0.17"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
-thiserror = "1.0"
-tokio = { version = "1.37", features = ["fs", "io-util", "macros", "rt-multi-thread", "sync", "time"] }
-tokio-util = { version = "0.7", features = ["io"] }
+clap = { version = "4", features = ["derive"] }
+futures-util = "0"
+indicatif = "0"
+reqwest = { version = "0", default-features = false, features = ["rustls-tls", "stream"] }
+thiserror = "1"
+tokio = { version = "1", features = ["fs", "io-util", "macros", "rt-multi-thread", "sync", "time"] }
+tokio-util = { version = "0", features = ["io"] }
 
 [dev-dependencies]
 hyper = { version = "0.14", features = ["full"] }
-tempfile = "3.10"
+tempfile = "3"
