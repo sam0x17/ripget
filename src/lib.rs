@@ -169,7 +169,6 @@ pub async fn download_url_with_progress(
         let url = url.to_string();
         let dest = dest.clone();
         let progress = progress.clone();
-        let buffer_size = buffer_size;
         let allow_full_body = threads == 1;
         join_set.spawn(async move {
             download_range(
@@ -392,6 +391,7 @@ fn parse_content_range_total(value: &HeaderValue, url: &str) -> Result<u64> {
 async fn prepare_file(path: &Path, size: u64) -> Result<()> {
     let file = OpenOptions::new()
         .create(true)
+        .truncate(true)
         .read(true)
         .write(true)
         .open(path)
@@ -640,22 +640,21 @@ mod tests {
                 .body(Body::empty())
                 .unwrap(),
             Method::GET => {
-                if let Some(range) = req.headers().get(RANGE) {
-                    if let Ok(range_str) = range.to_str() {
-                        if let Some((start, end)) = parse_range_header(range_str, data.len()) {
-                            let body = data[start..=end].to_vec();
-                            return Response::builder()
-                                .status(StatusCode::PARTIAL_CONTENT)
-                                .header(CONTENT_LENGTH, body.len().to_string())
-                                .header(
-                                    CONTENT_RANGE,
-                                    format!("bytes {}-{}/{}", start, end, data.len()),
-                                )
-                                .header(ACCEPT_RANGES, "bytes")
-                                .body(Body::from(body))
-                                .unwrap();
-                        }
-                    }
+                if let Some(range) = req.headers().get(RANGE)
+                    && let Ok(range_str) = range.to_str()
+                    && let Some((start, end)) = parse_range_header(range_str, data.len())
+                {
+                    let body = data[start..=end].to_vec();
+                    return Response::builder()
+                        .status(StatusCode::PARTIAL_CONTENT)
+                        .header(CONTENT_LENGTH, body.len().to_string())
+                        .header(
+                            CONTENT_RANGE,
+                            format!("bytes {}-{}/{}", start, end, data.len()),
+                        )
+                        .header(ACCEPT_RANGES, "bytes")
+                        .body(Body::from(body))
+                        .unwrap();
                 }
                 Response::builder()
                     .status(StatusCode::OK)

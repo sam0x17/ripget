@@ -119,7 +119,7 @@ fn default_output_path(url: &str) -> Result<PathBuf, Box<dyn std::error::Error>>
     let parsed = reqwest::Url::parse(url)?;
     let name = parsed
         .path_segments()
-        .and_then(|segments| segments.filter(|s| !s.is_empty()).next_back())
+        .and_then(|mut segments| segments.rfind(|s| !s.is_empty()))
         .unwrap_or("download");
     Ok(PathBuf::from(name))
 }
