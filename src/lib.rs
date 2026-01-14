@@ -315,7 +315,6 @@ fn split_ranges(total_len: u64, threads: usize) -> Vec<Range> {
     ranges
 }
 
-
 fn default_user_agent() -> String {
     format!("ripget/{}", env!("CARGO_PKG_VERSION"))
 }
