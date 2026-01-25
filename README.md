@@ -82,6 +82,28 @@ let report = ripget::download_url_with_options(
 println!("downloaded {} bytes", report.bytes);
 ```
 
+Windowed streaming (double-buffered range download):
+```
+# #[tokio::main]
+# async fn main() -> Result<(), ripget::RipgetError> {
+let options = ripget::WindowedDownloadOptions::new(10 * 1024 * 1024)
+    .threads(8);
+let mut stream = ripget::download_url_windowed(
+    "https://example.com/assets/large.bin",
+    options,
+).await?;
+let mut file = tokio::fs::File::create("large.bin").await?;
+tokio::io::copy(&mut stream, &mut file).await?;
+let report = stream.finish().await?;
+println!("streamed {} bytes", report.bytes);
+# Ok(())
+# }
+```
+Windowed streaming uses two in-memory buffers sized at `window_size / 2`
+(total resident memory ~= `window_size`, plus HTTP read buffers).
+The reader consumes directly from the current cold buffer; when it drains,
+it waits for the hot buffer to finish and then swaps without extra copies.
+
 For async readers with a known length:
 ```
 use tokio::io::{self, AsyncWriteExt};

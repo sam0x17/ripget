@@ -14,9 +14,13 @@
 //! # }
 //! ```
 
+use std::cell::UnsafeCell;
 use std::cmp;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use futures_util::TryStreamExt;
@@ -24,6 +28,7 @@ use reqwest::header::{ACCEPT_ENCODING, CONTENT_RANGE, HeaderMap, HeaderValue, RA
 use reqwest::{Client, StatusCode};
 use tokio::fs::OpenOptions;
 use tokio::io::{self, AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWriteExt, SeekFrom};
+use tokio::sync::{Notify, oneshot};
 use tokio::task::JoinSet;
 use tokio::time::{sleep, timeout};
 use tokio_util::io::StreamReader;
@@ -49,6 +54,8 @@ pub enum RipgetError {
     InvalidThreadCount(usize),
     #[error("invalid buffer size: {0}")]
     InvalidBufferSize(usize),
+    #[error("invalid window size: {0}")]
+    InvalidWindowSize(u64),
     #[error("missing Content-Range header for {0}")]
     ContentRangeMissing(String),
     #[error("invalid Content-Range header for {0}")]
@@ -137,6 +144,198 @@ impl DownloadOptions {
     }
 }
 
+/// Configuration for windowed URL downloads.
+#[derive(Clone)]
+pub struct WindowedDownloadOptions {
+    /// Size of the hot/cold window in bytes.
+    pub window_size: u64,
+    /// Override the number of parallel ranges.
+    pub threads: Option<usize>,
+    /// Override the HTTP user agent.
+    pub user_agent: Option<String>,
+    /// Optional progress reporter.
+    pub progress: Option<Progress>,
+    /// Override the read buffer size.
+    pub buffer_size: Option<usize>,
+}
+
+impl WindowedDownloadOptions {
+    /// Create a new options struct with the required window size.
+    pub fn new(window_size: u64) -> Self {
+        Self {
+            window_size,
+            threads: None,
+            user_agent: None,
+            progress: None,
+            buffer_size: None,
+        }
+    }
+
+    /// Override the number of parallel ranges.
+    pub fn threads(mut self, threads: usize) -> Self {
+        self.threads = Some(threads);
+        self
+    }
+
+    /// Override the HTTP user agent.
+    pub fn user_agent(mut self, user_agent: impl Into<String>) -> Self {
+        self.user_agent = Some(user_agent.into());
+        self
+    }
+
+    /// Supply a progress reporter.
+    pub fn progress(mut self, progress: Progress) -> Self {
+        self.progress = Some(progress);
+        self
+    }
+
+    /// Override the read buffer size.
+    pub fn buffer_size(mut self, buffer_size: usize) -> Self {
+        self.buffer_size = Some(buffer_size);
+        self
+    }
+}
+
+/// Information about a completed windowed stream download.
+#[derive(Debug, Clone)]
+pub struct StreamReport {
+    /// URL that was streamed.
+    pub url: String,
+    /// Total bytes read.
+    pub bytes: u64,
+    /// Number of parallel ranges used.
+    pub threads: usize,
+}
+
+/// Reader for a windowed URL download.
+pub struct WindowedDownload {
+    state: Arc<WindowState>,
+    result: oneshot::Receiver<Result<StreamReport>>,
+    expected_len: u64,
+    threads: usize,
+    next_seq: u64,
+    current_idx: Option<usize>,
+    current_offset: usize,
+    current_len: usize,
+    read_total: u64,
+    wait: Option<Pin<Box<dyn std::future::Future<Output = ()> + Send>>>,
+}
+
+impl WindowedDownload {
+    /// Total bytes expected from the stream.
+    pub fn expected_len(&self) -> u64 {
+        self.expected_len
+    }
+
+    /// Number of parallel ranges used.
+    pub fn threads(&self) -> usize {
+        self.threads
+    }
+
+    /// Wait for the background download to complete and return its report.
+    pub async fn finish(self) -> Result<StreamReport> {
+        match self.result.await {
+            Ok(result) => result,
+            Err(err) => Err(RipgetError::JoinError(err.to_string())),
+        }
+    }
+}
+
+impl AsyncRead for WindowedDownload {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        if buf.remaining() == 0 {
+            return Poll::Ready(Ok(()));
+        }
+
+        loop {
+            if this.read_total >= this.expected_len {
+                return Poll::Ready(Ok(()));
+            }
+
+            if let Some(idx) = this.current_idx {
+                let remaining_in_buffer = this.current_len.saturating_sub(this.current_offset);
+                if remaining_in_buffer == 0 {
+                    this.state.states[idx].store(BUFFER_EMPTY, Ordering::Release);
+                    this.state.notify.notify_waiters();
+                    this.current_idx = None;
+                    continue;
+                }
+
+                let to_copy = cmp::min(buf.remaining(), remaining_in_buffer);
+                let end = this.current_offset + to_copy;
+                let chunk = unsafe { this.state.buffers[idx].slice(this.current_offset, end) };
+                buf.put_slice(chunk);
+                this.current_offset = end;
+                this.read_total += to_copy as u64;
+                return Poll::Ready(Ok(()));
+            }
+
+            if this.wait.is_none() {
+                let notify = this.state.notify.clone();
+                this.wait = Some(Box::pin(async move {
+                    notify.notified().await;
+                }));
+            }
+
+            if let Some((idx, len)) = try_acquire_ready_buffer(this) {
+                this.current_idx = Some(idx);
+                this.current_offset = 0;
+                this.current_len = len;
+                this.wait = None;
+                continue;
+            }
+
+            if this.state.done.load(Ordering::Acquire) {
+                this.wait = None;
+                return Poll::Ready(Ok(()));
+            }
+
+            if let Some(wait) = &mut this.wait {
+                match wait.as_mut().poll(cx) {
+                    Poll::Ready(()) => {
+                        this.wait = None;
+                        continue;
+                    }
+                    Poll::Pending => return Poll::Pending,
+                }
+            }
+        }
+    }
+}
+
+fn try_acquire_ready_buffer(download: &mut WindowedDownload) -> Option<(usize, usize)> {
+    for idx in 0..download.state.buffers.len() {
+        let state = download.state.states[idx].load(Ordering::Acquire);
+        if state != BUFFER_READY {
+            continue;
+        }
+        let seq = download.state.seqs[idx].load(Ordering::Acquire);
+        if seq != download.next_seq {
+            continue;
+        }
+        if download.state.states[idx]
+            .compare_exchange(
+                BUFFER_READY,
+                BUFFER_READING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            continue;
+        }
+        let len = download.state.lens[idx].load(Ordering::Acquire) as usize;
+        download.next_seq = download.next_seq.saturating_add(1);
+        return Some((idx, len));
+    }
+    None
+}
+
 #[derive(Debug, Clone, Copy)]
 struct Range {
     start: u64,
@@ -146,6 +345,75 @@ struct Range {
 #[derive(Debug, Clone, Copy)]
 struct RemoteMetadata {
     len: u64,
+}
+
+const BUFFER_EMPTY: u8 = 0;
+const BUFFER_WRITING: u8 = 1;
+const BUFFER_READY: u8 = 2;
+const BUFFER_READING: u8 = 3;
+
+#[derive(Clone)]
+struct SharedBuffer {
+    data: Arc<UnsafeCell<Vec<u8>>>,
+    len: usize,
+}
+
+unsafe impl Send for SharedBuffer {}
+unsafe impl Sync for SharedBuffer {}
+
+impl SharedBuffer {
+    fn new(len: usize) -> Self {
+        let mut data = Vec::with_capacity(len);
+        data.resize(len, 0);
+        Self {
+            data: Arc::new(UnsafeCell::new(data)),
+            len,
+        }
+    }
+
+    unsafe fn slice_mut(&self, start: usize, end: usize) -> &mut [u8] {
+        debug_assert!(start <= end);
+        debug_assert!(end <= self.len);
+        unsafe {
+            // SAFETY: Caller guarantees no overlapping mutable ranges. The buffer is
+            // pre-sized and never reallocated while in use.
+            let ptr = (*self.data.get()).as_mut_ptr().add(start);
+            std::slice::from_raw_parts_mut(ptr, end - start)
+        }
+    }
+
+    unsafe fn slice(&self, start: usize, end: usize) -> &[u8] {
+        debug_assert!(start <= end);
+        debug_assert!(end <= self.len);
+        unsafe {
+            // SAFETY: Reads are only performed after the buffer range is fully
+            // written, and no other task mutates this range concurrently.
+            let ptr = (*self.data.get()).as_ptr().add(start);
+            std::slice::from_raw_parts(ptr, end - start)
+        }
+    }
+}
+
+struct WindowState {
+    buffers: [SharedBuffer; 2],
+    states: [AtomicU8; 2],
+    lens: [AtomicU64; 2],
+    seqs: [AtomicU64; 2],
+    notify: Arc<Notify>,
+    done: AtomicBool,
+}
+
+impl WindowState {
+    fn new(buffer_len: usize) -> Self {
+        Self {
+            buffers: [SharedBuffer::new(buffer_len), SharedBuffer::new(buffer_len)],
+            states: [AtomicU8::new(BUFFER_EMPTY), AtomicU8::new(BUFFER_EMPTY)],
+            lens: [AtomicU64::new(0), AtomicU64::new(0)],
+            seqs: [AtomicU64::new(0), AtomicU64::new(0)],
+            notify: Arc::new(Notify::new()),
+            done: AtomicBool::new(false),
+        }
+    }
 }
 
 /// Download a URL to a file path using parallel range requests.
@@ -185,6 +453,95 @@ pub async fn download_url_with_options(
         options.buffer_size,
     )
     .await
+}
+
+/// Download a URL as a sequential reader using a hot/cold window.
+///
+/// This streams the response using two in-memory buffers sized at
+/// `window_size / 2`. While one buffer is streamed to the reader, the next
+/// buffer is downloaded with the configured parallel range requests.
+/// The reader consumes directly from the cold buffer; once drained it waits
+/// for the hot buffer to complete and then swaps without extra copies.
+///
+/// * `window_size` must be at least 2 bytes; buffers are sized at
+///   `window_size / 2` (integer division).
+/// * `threads` defaults to 10 when `None`.
+/// * `user_agent` defaults to `ripget/<version>` when `None`.
+/// * `buffer_size` defaults to 16MB when `None`.
+///
+/// The returned [`WindowedDownload`] implements [`AsyncRead`]. Call
+/// [`WindowedDownload::finish`] to observe the final download status.
+pub async fn download_url_windowed(
+    url: impl AsRef<str>,
+    options: WindowedDownloadOptions,
+) -> Result<WindowedDownload> {
+    let url = url.as_ref().to_string();
+    let buffer_len = normalize_window_size(options.window_size)?;
+    let requested_threads = normalize_threads(options.threads)?;
+    let buffer_size = normalize_buffer_size(options.buffer_size)?;
+    let client = build_client(options.user_agent.as_deref())?;
+    let metadata = fetch_metadata(&client, &url).await?;
+    progress_init(&options.progress, metadata.len);
+
+    let threads = if metadata.len == 0 {
+        0
+    } else {
+        clamp_threads(requested_threads, metadata.len)
+    };
+    progress_set_threads(&options.progress, threads);
+    let (result_tx, result_rx) = oneshot::channel();
+    let state = Arc::new(WindowState::new(buffer_len));
+
+    if metadata.len == 0 {
+        let _ = result_tx.send(Ok(StreamReport {
+            url,
+            bytes: 0,
+            threads: 0,
+        }));
+        return Ok(WindowedDownload {
+            state,
+            result: result_rx,
+            expected_len: 0,
+            threads: 0,
+            next_seq: 0,
+            current_idx: None,
+            current_offset: 0,
+            current_len: 0,
+            read_total: 0,
+            wait: None,
+        });
+    }
+
+    let progress = options.progress.clone();
+    let state_task = state.clone();
+
+    tokio::spawn(async move {
+        let result = run_windowed_download(
+            client,
+            url,
+            metadata.len,
+            buffer_len,
+            threads,
+            progress,
+            buffer_size,
+            state_task,
+        )
+        .await;
+        let _ = result_tx.send(result);
+    });
+
+    Ok(WindowedDownload {
+        state,
+        result: result_rx,
+        expected_len: metadata.len,
+        threads,
+        next_seq: 0,
+        current_idx: None,
+        current_offset: 0,
+        current_len: 0,
+        read_total: 0,
+        wait: None,
+    })
 }
 
 /// Download a URL to a file path using parallel range requests with progress.
@@ -335,6 +692,82 @@ where
     })
 }
 
+async fn run_windowed_download(
+    client: Client,
+    url: String,
+    total_len: u64,
+    buffer_len: usize,
+    threads: usize,
+    progress: Option<Progress>,
+    buffer_size: usize,
+    state: Arc<WindowState>,
+) -> Result<StreamReport> {
+    let download_result = async {
+        let mut offset = 0u64;
+        let mut idx = 0usize;
+        let mut seq = 0u64;
+        while offset < total_len {
+            loop {
+                let notified = state.notify.notified();
+                if state.states[idx]
+                    .compare_exchange(
+                        BUFFER_EMPTY,
+                        BUFFER_WRITING,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .is_ok()
+                {
+                    break;
+                }
+                notified.await;
+            }
+
+            let remaining = total_len - offset;
+            let chunk_len = remaining.min(buffer_len as u64);
+            let buffer = state.buffers[idx].clone();
+            let allow_full_body = offset == 0 && chunk_len == total_len;
+
+            download_window_in_memory(
+                &client,
+                &url,
+                buffer,
+                offset,
+                chunk_len,
+                threads,
+                progress.clone(),
+                buffer_size,
+                allow_full_body,
+            )
+            .await?;
+
+            state.lens[idx].store(chunk_len, Ordering::Release);
+            state.seqs[idx].store(seq, Ordering::Release);
+            state.states[idx].store(BUFFER_READY, Ordering::Release);
+            state.notify.notify_waiters();
+
+            offset += chunk_len;
+            idx = (idx + 1) % state.buffers.len();
+            seq = seq.saturating_add(1);
+        }
+        Ok::<(), RipgetError>(())
+    }
+    .await;
+
+    state.done.store(true, Ordering::Release);
+    state.notify.notify_waiters();
+
+    if let Err(err) = download_result {
+        return Err(err);
+    }
+
+    Ok(StreamReport {
+        url,
+        bytes: total_len,
+        threads,
+    })
+}
+
 fn normalize_threads(threads: Option<usize>) -> Result<usize> {
     let threads = threads.unwrap_or(DEFAULT_THREADS);
     if threads == 0 {
@@ -349,6 +782,21 @@ fn normalize_buffer_size(buffer_size: Option<usize>) -> Result<usize> {
         return Err(RipgetError::InvalidBufferSize(buffer_size));
     }
     Ok(buffer_size)
+}
+
+fn normalize_window_size(window_size: u64) -> Result<usize> {
+    if window_size < 2 {
+        return Err(RipgetError::InvalidWindowSize(window_size));
+    }
+    let half = window_size / 2;
+    if half == 0 {
+        return Err(RipgetError::InvalidWindowSize(window_size));
+    }
+    let half = usize::try_from(half).map_err(|_| RipgetError::InvalidWindowSize(window_size))?;
+    if half == 0 {
+        return Err(RipgetError::InvalidWindowSize(window_size));
+    }
+    Ok(half)
 }
 
 fn clamp_threads(threads: usize, total_len: u64) -> usize {
@@ -548,6 +996,146 @@ async fn download_range(
     }
 }
 
+async fn download_window_in_memory(
+    client: &Client,
+    url: &str,
+    buffer: SharedBuffer,
+    window_start: u64,
+    window_len: u64,
+    threads: usize,
+    progress: Option<Progress>,
+    buffer_size: usize,
+    allow_full_body: bool,
+) -> Result<()> {
+    if window_len == 0 {
+        return Ok(());
+    }
+
+    let threads = clamp_threads(threads, window_len);
+    let ranges = split_ranges(window_len, threads);
+    let mut join_set = JoinSet::new();
+    for range in ranges {
+        let client = client.clone();
+        let url = url.to_string();
+        let buffer = buffer.clone();
+        let progress = progress.clone();
+        let request_range = Range {
+            start: window_start + range.start,
+            end: window_start + range.end,
+        };
+        join_set.spawn(async move {
+            download_range_window_to_buffer(
+                &client,
+                &url,
+                &buffer,
+                range,
+                request_range,
+                progress,
+                buffer_size,
+                allow_full_body,
+            )
+            .await
+        });
+    }
+
+    while let Some(result) = join_set.join_next().await {
+        match result {
+            Ok(inner) => inner?,
+            Err(err) => return Err(RipgetError::JoinError(err.to_string())),
+        }
+    }
+    Ok(())
+}
+
+async fn download_range_window_to_buffer(
+    client: &Client,
+    url: &str,
+    buffer: &SharedBuffer,
+    file_range: Range,
+    request_range: Range,
+    progress: Option<Progress>,
+    buffer_size: usize,
+    allow_full_body: bool,
+) -> Result<()> {
+    let mut offset = file_range.start;
+    let mut attempt = 0usize;
+    loop {
+        if offset > file_range.end {
+            return Ok(());
+        }
+
+        let request_start = request_range.start + (offset - file_range.start);
+        let response = match client
+            .get(url)
+            .header(
+                RANGE,
+                format!("bytes={}-{}", request_start, request_range.end),
+            )
+            .send()
+            .await
+        {
+            Ok(resp) => resp,
+            Err(err) => {
+                if !is_retryable_reqwest_error(&err) {
+                    return Err(RipgetError::Http(err));
+                }
+                sleep_with_backoff(attempt, None).await;
+                attempt = attempt.saturating_add(1);
+                continue;
+            }
+        };
+
+        let status = response.status();
+        if is_fatal_status(status) {
+            return Err(RipgetError::HttpStatus {
+                status,
+                url: url.to_string(),
+            });
+        }
+        if status != StatusCode::PARTIAL_CONTENT {
+            if status == StatusCode::OK
+                && allow_full_body
+                && request_range.start == 0
+                && offset == file_range.start
+                && file_range.start == 0
+            {
+                // Server ignored the range header for the full-file request.
+            } else {
+                let retry_after = retry_after_delay(response.headers());
+                sleep_with_backoff(attempt, retry_after).await;
+                attempt = attempt.saturating_add(1);
+                continue;
+            }
+        }
+
+        let stream = response.bytes_stream().map_err(io::Error::other);
+        let mut reader = StreamReader::new(stream);
+        let start_offset = offset;
+        match write_range_from_reader_to_buffer(
+            &mut reader,
+            buffer,
+            file_range,
+            &mut offset,
+            &progress,
+            buffer_size,
+            Some(READ_IDLE_TIMEOUT),
+        )
+        .await
+        {
+            Ok(()) => return Ok(()),
+            Err(err) if is_retryable_error(&err) => {
+                if offset > start_offset {
+                    attempt = 0;
+                }
+                sleep_with_backoff(attempt, None).await;
+                attempt = attempt.saturating_add(1);
+                continue;
+            }
+            Err(err) => return Err(err),
+        }
+    }
+}
+
 async fn write_range_from_reader<R: AsyncRead + Unpin>(
     reader: &mut R,
     path: &Path,
@@ -571,6 +1159,39 @@ async fn write_range_from_reader<R: AsyncRead + Unpin>(
 
         file.seek(SeekFrom::Start(*offset)).await?;
         file.write_all(&buf[..n]).await?;
+        progress_add(progress, n as u64);
+        *offset += n as u64;
+        remaining -= n as u64;
+    }
+
+    if remaining != 0 {
+        let got = expected - remaining;
+        return Err(RipgetError::UnexpectedEof { expected, got });
+    }
+    Ok(())
+}
+
+async fn write_range_from_reader_to_buffer<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    buffer: &SharedBuffer,
+    range: Range,
+    offset: &mut u64,
+    progress: &Option<Progress>,
+    buffer_size: usize,
+    idle_timeout: Option<Duration>,
+) -> Result<()> {
+    let expected = range.end - *offset + 1;
+    let mut remaining = expected;
+
+    while remaining > 0 {
+        let read_len = cmp::min(remaining as usize, buffer_size);
+        let start = *offset as usize;
+        let end = start + read_len;
+        let slice = unsafe { buffer.slice_mut(start, end) };
+        let n = read_fully_with_timeout(reader, slice, idle_timeout).await?;
+        if n == 0 {
+            break;
+        }
         progress_add(progress, n as u64);
         *offset += n as u64;
         remaining -= n as u64;
@@ -693,8 +1314,9 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use tempfile::tempdir;
-    use tokio::io::AsyncWriteExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::sync::oneshot;
+    use tokio::time::{Duration, sleep};
 
     fn handle_request(req: Request<Body>, data: Arc<Vec<u8>>) -> Response<Body> {
         match *req.method() {
@@ -848,6 +1470,145 @@ mod tests {
 
         let _ = tx.send(());
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn download_url_windowed_streams() -> Result<()> {
+        let data: Vec<u8> = (0..(256 * 1024)).map(|i| (i % 251) as u8).collect();
+        let (addr, shutdown) = spawn_range_server(Arc::new(data.clone())).await;
+
+        let url = format!("http://{}/file.bin", addr);
+        let options = WindowedDownloadOptions::new(64 * 1024).threads(4);
+        let mut download = download_url_windowed(&url, options).await?;
+        let mut received = Vec::new();
+        download.read_to_end(&mut received).await?;
+        let report = download.finish().await?;
+
+        assert_eq!(received, data);
+        assert_eq!(report.bytes as usize, data.len());
+
+        let _ = shutdown.send(());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn download_url_windowed_reports_progress() -> Result<()> {
+        let data: Vec<u8> = (0..(128 * 1024)).map(|i| (i % 251) as u8).collect();
+        let (addr, shutdown) = spawn_range_server(Arc::new(data.clone())).await;
+
+        let progress = Arc::new(TestProgress {
+            total: Mutex::new(None),
+            seen: Mutex::new(0),
+        });
+
+        let url = format!("http://{}/file.bin", addr);
+        let options = WindowedDownloadOptions::new(64 * 1024)
+            .threads(4)
+            .progress(progress.clone());
+        let mut download = download_url_windowed(&url, options).await?;
+        let mut received = Vec::new();
+        download.read_to_end(&mut received).await?;
+        let report = download.finish().await?;
+
+        assert_eq!(received, data);
+        assert_eq!(report.bytes as usize, data.len());
+        assert_eq!(*progress.total.lock().unwrap(), Some(data.len() as u64));
+        assert_eq!(*progress.seen.lock().unwrap(), data.len() as u64);
+
+        let _ = shutdown.send(());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn download_url_windowed_is_sequential() -> Result<()> {
+        let data: Vec<u8> = (0..(192 * 1024 + 123)).map(|i| (i % 251) as u8).collect();
+        let (addr, shutdown) = spawn_range_server(Arc::new(data.clone())).await;
+
+        let url = format!("http://{}/file.bin", addr);
+        let options = WindowedDownloadOptions::new(64 * 1024).threads(4);
+        let mut download = download_url_windowed(&url, options).await?;
+
+        let mut offset = 0usize;
+        let mut buf = vec![0u8; 1537];
+        loop {
+            let n = download.read(&mut buf).await?;
+            if n == 0 {
+                break;
+            }
+            let expected = &data[offset..offset + n];
+            assert_eq!(&buf[..n], expected);
+            offset += n;
+        }
+        assert_eq!(offset, data.len());
+        let report = download.finish().await?;
+        assert_eq!(report.bytes as usize, data.len());
+
+        let _ = shutdown.send(());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn download_url_windowed_many_swaps_is_sequential() -> Result<()> {
+        let data: Vec<u8> = (0..(64 * 1024 + 333)).map(|i| (i % 251) as u8).collect();
+        let (addr, shutdown) = spawn_range_server(Arc::new(data.clone())).await;
+
+        let url = format!("http://{}/file.bin", addr);
+        let options = WindowedDownloadOptions::new(8 * 1024).threads(4);
+        let mut download = download_url_windowed(&url, options).await?;
+
+        let mut offset = 0usize;
+        let mut buf = vec![0u8; 1025];
+        loop {
+            let n = download.read(&mut buf).await?;
+            if n == 0 {
+                break;
+            }
+            let expected = &data[offset..offset + n];
+            assert_eq!(&buf[..n], expected);
+            offset += n;
+        }
+        assert_eq!(offset, data.len());
+        let report = download.finish().await?;
+        assert_eq!(report.bytes as usize, data.len());
+
+        let _ = shutdown.send(());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn download_url_windowed_slow_reader_is_sequential() -> Result<()> {
+        let data: Vec<u8> = (0..(128 * 1024 + 7)).map(|i| (i % 251) as u8).collect();
+        let (addr, shutdown) = spawn_range_server(Arc::new(data.clone())).await;
+
+        let url = format!("http://{}/file.bin", addr);
+        let options = WindowedDownloadOptions::new(64 * 1024).threads(4);
+        let mut download = download_url_windowed(&url, options).await?;
+
+        let mut offset = 0usize;
+        let mut buf = vec![0u8; 512];
+        loop {
+            let n = download.read(&mut buf).await?;
+            if n == 0 {
+                break;
+            }
+            let expected = &data[offset..offset + n];
+            assert_eq!(&buf[..n], expected);
+            offset += n;
+            sleep(Duration::from_millis(1)).await;
+        }
+        assert_eq!(offset, data.len());
+        let report = download.finish().await?;
+        assert_eq!(report.bytes as usize, data.len());
+
+        let _ = shutdown.send(());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn download_url_windowed_rejects_small_window() {
+        let options = WindowedDownloadOptions::new(1);
+        let result = download_url_windowed("http://example.com/file.bin", options).await;
+        assert!(matches!(result, Err(RipgetError::InvalidWindowSize(1))));
     }
 
     #[tokio::test]
