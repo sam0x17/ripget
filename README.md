@@ -70,6 +70,18 @@ println!("downloaded {} bytes", report.bytes);
 # }
 ```
 
+Override the user agent programmatically:
+```
+let options = ripget::DownloadOptions::new()
+    .user_agent(format!("my-app/{}", env!("CARGO_PKG_VERSION")));
+let report = ripget::download_url_with_options(
+    "https://example.com/assets/large.bin",
+    "large.bin",
+    options,
+).await?;
+println!("downloaded {} bytes", report.bytes);
+```
+
 For async readers with a known length:
 ```
 use tokio::io::{self, AsyncWriteExt};

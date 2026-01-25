@@ -93,6 +93,50 @@ pub trait ProgressReporter: Send + Sync {
 /// Shared progress reporter handle.
 pub type Progress = Arc<dyn ProgressReporter>;
 
+/// Configuration for URL downloads.
+#[derive(Clone, Default)]
+pub struct DownloadOptions {
+    /// Override the number of parallel ranges.
+    pub threads: Option<usize>,
+    /// Override the HTTP user agent.
+    pub user_agent: Option<String>,
+    /// Optional progress reporter.
+    pub progress: Option<Progress>,
+    /// Override the read buffer size.
+    pub buffer_size: Option<usize>,
+}
+
+impl DownloadOptions {
+    /// Create a new options struct with defaults.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Override the number of parallel ranges.
+    pub fn threads(mut self, threads: usize) -> Self {
+        self.threads = Some(threads);
+        self
+    }
+
+    /// Override the HTTP user agent.
+    pub fn user_agent(mut self, user_agent: impl Into<String>) -> Self {
+        self.user_agent = Some(user_agent.into());
+        self
+    }
+
+    /// Supply a progress reporter.
+    pub fn progress(mut self, progress: Progress) -> Self {
+        self.progress = Some(progress);
+        self
+    }
+
+    /// Override the read buffer size.
+    pub fn buffer_size(mut self, buffer_size: usize) -> Self {
+        self.buffer_size = Some(buffer_size);
+        self
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct Range {
     start: u64,
@@ -121,6 +165,26 @@ pub async fn download_url(
     user_agent: Option<&str>,
 ) -> Result<DownloadReport> {
     download_url_with_progress(url, dest, threads, user_agent, None, None).await
+}
+
+/// Download a URL to a file path using parallel range requests with options.
+///
+/// This is a convenience wrapper around [`download_url_with_progress`] that
+/// accepts owned option values like user agents.
+pub async fn download_url_with_options(
+    url: impl AsRef<str>,
+    dest: impl AsRef<Path>,
+    options: DownloadOptions,
+) -> Result<DownloadReport> {
+    download_url_with_progress(
+        url,
+        dest,
+        options.threads,
+        options.user_agent.as_deref(),
+        options.progress,
+        options.buffer_size,
+    )
+    .await
 }
 
 /// Download a URL to a file path using parallel range requests with progress.
@@ -621,11 +685,12 @@ fn is_retryable_reqwest_error(err: &reqwest::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hyper::header::{ACCEPT_RANGES, CONTENT_LENGTH, CONTENT_RANGE, RANGE};
+    use hyper::header::{ACCEPT_RANGES, CONTENT_LENGTH, CONTENT_RANGE, RANGE, USER_AGENT};
     use hyper::service::{make_service_fn, service_fn};
     use hyper::{Body, Method, Request, Response, Server, StatusCode};
     use std::convert::Infallible;
     use std::net::SocketAddr;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use tempfile::tempdir;
     use tokio::io::AsyncWriteExt;
@@ -722,6 +787,66 @@ mod tests {
         let downloaded = tokio::fs::read(&path).await?;
         assert_eq!(downloaded, data);
         let _ = shutdown.send(());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn download_url_sets_user_agent() -> Result<()> {
+        let data: Vec<u8> = (0..(1024 * 128)).map(|i| (i % 251) as u8).collect();
+        let data = Arc::new(data);
+        let expected = Arc::new("ripget-test/1.0".to_string());
+        let mismatch = Arc::new(AtomicBool::new(false));
+        let seen = Arc::new(AtomicUsize::new(0));
+
+        let data_for_svc = data.clone();
+        let expected_for_svc = expected.clone();
+        let mismatch_for_svc = mismatch.clone();
+        let seen_for_svc = seen.clone();
+
+        let make_svc = make_service_fn(move |_| {
+            let data = data_for_svc.clone();
+            let expected = expected_for_svc.clone();
+            let mismatch = mismatch_for_svc.clone();
+            let seen = seen_for_svc.clone();
+            async move {
+                Ok::<_, Infallible>(service_fn(move |req| {
+                    let data = data.clone();
+                    let expected = expected.clone();
+                    let mismatch = mismatch.clone();
+                    let seen = seen.clone();
+                    async move {
+                        let ua = req.headers().get(USER_AGENT).and_then(|v| v.to_str().ok());
+                        if ua != Some(expected.as_str()) {
+                            mismatch.store(true, Ordering::Relaxed);
+                        }
+                        seen.fetch_add(1, Ordering::Relaxed);
+                        Ok::<_, Infallible>(handle_request(req, data))
+                    }
+                }))
+            }
+        });
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = Server::from_tcp(listener).unwrap().serve(make_svc);
+        let (tx, rx) = oneshot::channel();
+        let graceful = server.with_graceful_shutdown(async {
+            let _ = rx.await;
+        });
+        tokio::spawn(graceful);
+
+        let dir = tempdir()?;
+        let path = dir.path().join("ua.bin");
+        let url = format!("http://{}/ua.bin", addr);
+
+        let options = DownloadOptions::new().user_agent(expected.as_str());
+        let report = download_url_with_options(&url, &path, options).await?;
+        assert_eq!(report.bytes as usize, data.len());
+
+        assert!(!mismatch.load(Ordering::Relaxed));
+        assert!(seen.load(Ordering::Relaxed) > 0);
+
+        let _ = tx.send(());
         Ok(())
     }
 
