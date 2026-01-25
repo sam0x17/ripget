@@ -268,7 +268,8 @@ impl AsyncRead for WindowedDownload {
 
                 let to_copy = cmp::min(buf.remaining(), remaining_in_buffer);
                 let end = this.current_offset + to_copy;
-                let chunk = unsafe { this.state.buffers[idx].slice(this.current_offset, end) };
+                let ptr = unsafe { this.state.buffers[idx].read_ptr(this.current_offset, end) };
+                let chunk = unsafe { std::slice::from_raw_parts(ptr, to_copy) };
                 buf.put_slice(chunk);
                 this.current_offset = end;
                 this.read_total += to_copy as u64;
@@ -352,45 +353,62 @@ const BUFFER_WRITING: u8 = 1;
 const BUFFER_READY: u8 = 2;
 const BUFFER_READING: u8 = 3;
 
-#[derive(Clone)]
+struct SharedCell<T> {
+    inner: UnsafeCell<T>,
+}
+
+unsafe impl<T: Send> Send for SharedCell<T> {}
+unsafe impl<T: Send> Sync for SharedCell<T> {}
+
+impl<T> SharedCell<T> {
+    fn new(value: T) -> Self {
+        Self {
+            inner: UnsafeCell::new(value),
+        }
+    }
+
+    fn get(&self) -> *mut T {
+        self.inner.get()
+    }
+}
+
 struct SharedBuffer {
-    data: Arc<UnsafeCell<Vec<u8>>>,
+    data: Arc<SharedCell<Vec<u8>>>,
     len: usize,
 }
 
-unsafe impl Send for SharedBuffer {}
-unsafe impl Sync for SharedBuffer {}
+impl Clone for SharedBuffer {
+    fn clone(&self) -> Self {
+        Self {
+            data: self.data.clone(),
+            len: self.len,
+        }
+    }
+}
 
 impl SharedBuffer {
     fn new(len: usize) -> Self {
-        let mut data = Vec::with_capacity(len);
-        data.resize(len, 0);
+        let data = vec![0; len];
         Self {
-            data: Arc::new(UnsafeCell::new(data)),
+            data: Arc::new(SharedCell::new(data)),
             len,
         }
     }
 
-    unsafe fn slice_mut(&self, start: usize, end: usize) -> &mut [u8] {
+    unsafe fn write_ptr(&self, start: usize, end: usize) -> *mut u8 {
         debug_assert!(start <= end);
         debug_assert!(end <= self.len);
-        unsafe {
-            // SAFETY: Caller guarantees no overlapping mutable ranges. The buffer is
-            // pre-sized and never reallocated while in use.
-            let ptr = (*self.data.get()).as_mut_ptr().add(start);
-            std::slice::from_raw_parts_mut(ptr, end - start)
-        }
+        // SAFETY: Caller guarantees no overlapping mutable ranges. The buffer is
+        // pre-sized and never reallocated while in use.
+        unsafe { (*self.data.get()).as_mut_ptr().add(start) }
     }
 
-    unsafe fn slice(&self, start: usize, end: usize) -> &[u8] {
+    unsafe fn read_ptr(&self, start: usize, end: usize) -> *const u8 {
         debug_assert!(start <= end);
         debug_assert!(end <= self.len);
-        unsafe {
-            // SAFETY: Reads are only performed after the buffer range is fully
-            // written, and no other task mutates this range concurrently.
-            let ptr = (*self.data.get()).as_ptr().add(start);
-            std::slice::from_raw_parts(ptr, end - start)
-        }
+        // SAFETY: Reads are only performed after the buffer range is fully
+        // written, and no other task mutates this range concurrently.
+        unsafe { (*self.data.get()).as_ptr().add(start) }
     }
 }
 
@@ -692,6 +710,7 @@ where
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_windowed_download(
     client: Client,
     url: String,
@@ -757,9 +776,7 @@ async fn run_windowed_download(
     state.done.store(true, Ordering::Release);
     state.notify.notify_waiters();
 
-    if let Err(err) = download_result {
-        return Err(err);
-    }
+    download_result?;
 
     Ok(StreamReport {
         url,
@@ -996,6 +1013,7 @@ async fn download_range(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn download_window_in_memory(
     client: &Client,
     url: &str,
@@ -1047,6 +1065,7 @@ async fn download_window_in_memory(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn download_range_window_to_buffer(
     client: &Client,
     url: &str,
@@ -1187,7 +1206,8 @@ async fn write_range_from_reader_to_buffer<R: AsyncRead + Unpin>(
         let read_len = cmp::min(remaining as usize, buffer_size);
         let start = *offset as usize;
         let end = start + read_len;
-        let slice = unsafe { buffer.slice_mut(start, end) };
+        let ptr = unsafe { buffer.write_ptr(start, end) };
+        let slice = unsafe { std::slice::from_raw_parts_mut(ptr, read_len) };
         let n = read_fully_with_timeout(reader, slice, idle_timeout).await?;
         if n == 0 {
             break;
