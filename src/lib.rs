@@ -1,25 +1,143 @@
 //! Fast, multi-part downloads with a simple API.
 //!
-//! ripget prioritizes speed by downloading large files in parallel with HTTP
-//! range requests.
+//! ripget prioritizes speed by downloading large files in parallel with HTTP range requests.
+//! The default configuration uses 10 parallel ranges and 16MB buffers, similar in spirit to
+//! aria2c.
 //!
-//! # Example
+//! # Features
+//! - Download files as fast as possible using HTTP multiplexing
+//! - Overwrites existing output files by default
+//! - Interactive CLI progress bar in terminals
+//! - Automatic retry with exponential backoff for network throttling or disconnects
+//! - Per-range idle timeout reconnects after 15 seconds without data
+//! - Configurable parallelism with simple overrides
+//! - Windowed streaming mode for sequential consumers
+//! - Async library API powered by tokio and reqwest
+//!
+//! # Install
+//! ```sh
+//! cargo install ripget
+//! ```
+//!
+//! # CLI usage
+//! ```sh
+//! ripget "https://example.com/assets/large.bin"
+//! ```
+//!
+//! Override the buffer size:
+//! ```sh
+//! ripget --cache-size 8mb "https://example.com/assets/large.bin"
+//! ```
+//!
+//! Override the output name:
+//! ```sh
+//! ripget "https://example.com/assets/large.bin" my_file.blob
+//! ```
+//!
+//! ## Environment overrides
+//! - `RIPGET_THREADS`: override the default parallel range count
+//! - `RIPGET_USER_AGENT`: override the HTTP user agent
+//! - `RIPGET_CACHE_SIZE`: override the read buffer size (e.g. `8mb`)
+//!
+//! ## CLI options
+//! - `--threads <N>`: override the default parallel range count
+//! - `--user-agent <UA>`: override the HTTP user agent
+//! - `--silent`: disable the progress bar
+//! - `--cache-size <SIZE>`: override the read buffer size (e.g. `8mb`)
+//!
+//! # Library usage
 //! ```no_run
 //! # #[tokio::main]
 //! # async fn main() -> Result<(), ripget::RipgetError> {
-//! let report = ripget::download_url("https://example.com/large.bin", "large.bin", None, None)
-//!     .await?;
-//! println!("downloaded {} bytes to {:?}", report.bytes, report.path);
+//! let report = ripget::download_url(
+//!     "https://example.com/assets/large.bin",
+//!     "large.bin",
+//!     None,
+//!     None,
+//! )
+//! .await?;
+//! println!("downloaded {} bytes", report.bytes);
 //! # Ok(())
 //! # }
 //! ```
+//!
+//! Override the user agent programmatically:
+//! ```no_run
+//! # #[tokio::main]
+//! # async fn main() -> Result<(), ripget::RipgetError> {
+//! let options = ripget::DownloadOptions::new()
+//!     .user_agent(format!("my-app/{}", env!("CARGO_PKG_VERSION")));
+//! let report = ripget::download_url_with_options(
+//!     "https://example.com/assets/large.bin",
+//!     "large.bin",
+//!     options,
+//! )
+//! .await?;
+//! println!("downloaded {} bytes", report.bytes);
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! Windowed streaming (double-buffered range download):
+//! ```no_run
+//! # #[tokio::main]
+//! # async fn main() -> Result<(), ripget::RipgetError> {
+//! let options = ripget::WindowedDownloadOptions::new(10 * 1024 * 1024)
+//!     .threads(8);
+//! let mut stream = ripget::download_url_windowed(
+//!     "https://example.com/assets/large.bin",
+//!     options,
+//! )
+//! .await?;
+//! let mut file = tokio::fs::File::create("large.bin").await?;
+//! tokio::io::copy(&mut stream, &mut file).await?;
+//! let report = stream.finish().await?;
+//! println!("streamed {} bytes", report.bytes);
+//! # Ok(())
+//! # }
+//! ```
+//! Windowed streaming uses two in-memory buffers sized at `window_size / 2` (total resident
+//! memory ~= `window_size`, plus HTTP read buffers). The reader consumes directly from the
+//! current cold buffer; when it drains, it waits for the hot buffer to finish and then swaps
+//! without extra copies. If the stream is dropped or `finish()` is called early, the
+//! background download is cancelled and `finish()` returns a report for the bytes read.
+//!
+//! For async readers with a known length:
+//! ```no_run
+//! use tokio::io::AsyncWriteExt;
+//! # #[tokio::main]
+//! # async fn main() -> Result<(), ripget::RipgetError> {
+//! let data = b"hello from a stream".to_vec();
+//! let (mut tx, rx) = tokio::io::duplex(64);
+//! let data_clone = data.clone();
+//! tokio::spawn(async move {
+//!     let _ = tx.write_all(&data_clone).await;
+//! });
+//! let report = ripget::download_reader(rx, "out.bin", data.len() as u64).await?;
+//! println!("downloaded {} bytes", report.bytes);
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! # Retry behavior
+//! ripget retries network failures and most HTTP statuses with exponential backoff to handle
+//! throttling or transient outages. Only 404 and 500 responses are treated as fatal. Each
+//! range reconnects if no data arrives for 15 seconds.
+//!
+//! # Limitations
+//! - The server must support HTTP range requests and report the full size.
+//!
+//! # License
+//! Licensed under either of:
+//! - Apache License, Version 2.0 (`LICENSE-APACHE`)
+//! - MIT license (`LICENSE-MIT`)
 
 use std::cell::UnsafeCell;
 use std::cmp;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -152,6 +270,9 @@ impl DownloadOptions {
 }
 
 /// Configuration for windowed URL downloads.
+///
+/// `window_size` controls the total hot/cold in-memory window; each buffer is `window_size /
+/// 2`. Larger windows improve throughput at the cost of memory.
 #[derive(Clone)]
 pub struct WindowedDownloadOptions {
     /// Size of the hot/cold window in bytes.
@@ -168,6 +289,8 @@ pub struct WindowedDownloadOptions {
 
 impl WindowedDownloadOptions {
     /// Create a new options struct with the required window size.
+    ///
+    /// The window size must be at least 2 bytes.
     pub fn new(window_size: u64) -> Self {
         Self {
             window_size,
@@ -204,6 +327,8 @@ impl WindowedDownloadOptions {
 }
 
 /// Information about a completed windowed stream download.
+///
+/// If the stream was not fully read, `bytes` reports the number of bytes read.
 #[derive(Debug, Clone)]
 pub struct StreamReport {
     /// URL that was streamed.
@@ -215,6 +340,8 @@ pub struct StreamReport {
 }
 
 /// Reader for a windowed URL download.
+///
+/// Dropping the reader cancels the background download without error.
 pub struct WindowedDownload {
     state: Arc<WindowState>,
     result: Option<oneshot::Receiver<Result<StreamReport>>>,
@@ -243,14 +370,12 @@ impl WindowedDownload {
 
     /// Wait for the background download to complete and return its report.
     ///
-    /// If the stream was not fully read, this cancels the background download
-    /// and returns a report for the bytes that were read.
+    /// If the stream was not fully read, this cancels the background download and returns a
+    /// report for the bytes that were read.
     pub async fn finish(mut self) -> Result<StreamReport> {
         let partial = self.read_total < self.expected_len;
         if partial && !self.state.done.load(Ordering::Acquire) {
-            self.state
-                .cancelled
-                .store(true, Ordering::Release);
+            self.state.cancelled.store(true, Ordering::Release);
             self.state.notify.notify_one();
         }
         let read_total = self.read_total;
@@ -426,6 +551,8 @@ impl<T> SharedCell<T> {
     }
 }
 
+// Internal shared buffer for windowed downloads. Range splitting is validated and
+// bounds-checked before any unsafe writes.
 struct SharedBuffer {
     data: Arc<SharedCell<Vec<u8>>>,
     len: usize,
@@ -452,16 +579,16 @@ impl SharedBuffer {
     unsafe fn write_ptr(&self, start: usize, end: usize) -> *mut u8 {
         debug_assert!(start <= end);
         debug_assert!(end <= self.len);
-        // SAFETY: Caller guarantees no overlapping mutable ranges. The buffer is
-        // pre-sized and never reallocated while in use.
+        // SAFETY: Caller guarantees no overlapping mutable ranges. The buffer is pre-sized and
+        // never reallocated while in use.
         unsafe { (*self.data.get()).as_mut_ptr().add(start) }
     }
 
     unsafe fn read_ptr(&self, start: usize, end: usize) -> *const u8 {
         debug_assert!(start <= end);
         debug_assert!(end <= self.len);
-        // SAFETY: Reads are only performed after the buffer range is fully
-        // written, and no other task mutates this range concurrently.
+        // SAFETY: Reads are only performed after the buffer range is fully written, and no
+        // other task mutates this range concurrently.
         unsafe { (*self.data.get()).as_ptr().add(start) }
     }
 }
@@ -524,8 +651,8 @@ pub async fn download_url(
 
 /// Download a URL to a file path using parallel range requests with options.
 ///
-/// This is a convenience wrapper around [`download_url_with_progress`] that
-/// accepts owned option values like user agents.
+/// This is a convenience wrapper around [`download_url_with_progress`] that accepts owned
+/// option values like user agents.
 pub async fn download_url_with_options(
     url: impl AsRef<str>,
     dest: impl AsRef<Path>,
@@ -544,22 +671,21 @@ pub async fn download_url_with_options(
 
 /// Download a URL as a sequential reader using a hot/cold window.
 ///
-/// This streams the response using two in-memory buffers sized at
-/// `window_size / 2`. While one buffer is streamed to the reader, the next
-/// buffer is downloaded with the configured parallel range requests.
-/// The reader consumes directly from the cold buffer; once drained it waits
-/// for the hot buffer to complete and then swaps without extra copies.
+/// This streams the response using two in-memory buffers sized at `window_size / 2`. While one
+/// buffer is streamed to the reader, the next buffer is downloaded with the configured
+/// parallel range requests. The reader consumes directly from the cold buffer; once drained it
+/// waits for the hot buffer to complete and then swaps without extra copies.
 ///
-/// * `window_size` must be at least 2 bytes; buffers are sized at
-///   `window_size / 2` (integer division).
+/// * `window_size` must be at least 2 bytes; buffers are sized at `window_size / 2` (integer
+///   division).
 /// * `threads` defaults to 10 when `None`.
 /// * Very small windows reduce the effective parallel range count.
 /// * `user_agent` defaults to `ripget/<version>` when `None`.
 /// * `buffer_size` defaults to 16MB when `None`.
 ///
 /// The returned [`WindowedDownload`] implements [`AsyncRead`]. Call
-/// [`WindowedDownload::finish`] to observe the final download status. Dropping
-/// the reader cancels the background download.
+/// [`WindowedDownload::finish`] to observe the final download status (or a partial report if
+/// not fully read). Dropping the reader cancels the background download without error.
 pub async fn download_url_windowed(
     url: impl AsRef<str>,
     options: WindowedDownloadOptions,
