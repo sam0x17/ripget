@@ -24,6 +24,7 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use futures_util::TryStreamExt;
+use futures_util::stream::{FuturesUnordered, StreamExt};
 use reqwest::header::{ACCEPT_ENCODING, CONTENT_RANGE, HeaderMap, HeaderValue, RANGE, RETRY_AFTER};
 use reqwest::{Client, StatusCode};
 use tokio::fs::OpenOptions;
@@ -43,6 +44,8 @@ const READ_IDLE_TIMEOUT: Duration = Duration::from_secs(15);
 const RETRY_BASE_DELAY_MS: u64 = 1_000;
 const RETRY_MAX_DELAY_MS: u64 = 30_000;
 const RETRY_MAX_EXPONENT: usize = 10;
+// Avoid spawning tiny range requests in windowed mode.
+const MIN_WINDOW_RANGE: u64 = 128 * 1024;
 
 /// Result type for ripget operations.
 pub type Result<T> = std::result::Result<T, RipgetError>;
@@ -210,7 +213,8 @@ pub struct StreamReport {
 /// Reader for a windowed URL download.
 pub struct WindowedDownload {
     state: Arc<WindowState>,
-    result: oneshot::Receiver<Result<StreamReport>>,
+    result: Option<oneshot::Receiver<Result<StreamReport>>>,
+    task: Option<tokio::task::JoinHandle<()>>,
     expected_len: u64,
     threads: usize,
     next_seq: u64,
@@ -233,11 +237,24 @@ impl WindowedDownload {
     }
 
     /// Wait for the background download to complete and return its report.
-    pub async fn finish(self) -> Result<StreamReport> {
-        match self.result.await {
+    pub async fn finish(mut self) -> Result<StreamReport> {
+        let result = self.result.take().ok_or_else(|| {
+            RipgetError::JoinError("windowed download result already taken".to_string())
+        })?;
+        match result.await {
             Ok(result) => result,
             Err(err) => Err(RipgetError::JoinError(err.to_string())),
         }
+    }
+}
+
+impl Drop for WindowedDownload {
+    fn drop(&mut self) {
+        if let Some(handle) = self.task.take() {
+            handle.abort();
+        }
+        self.state.done.store(true, Ordering::Release);
+        self.state.notify.notify_one();
     }
 }
 
@@ -261,7 +278,7 @@ impl AsyncRead for WindowedDownload {
                 let remaining_in_buffer = this.current_len.saturating_sub(this.current_offset);
                 if remaining_in_buffer == 0 {
                     this.state.states[idx].store(BUFFER_EMPTY, Ordering::Release);
-                    this.state.notify.notify_waiters();
+                    this.state.notify.notify_one();
                     this.current_idx = None;
                     continue;
                 }
@@ -484,11 +501,13 @@ pub async fn download_url_with_options(
 /// * `window_size` must be at least 2 bytes; buffers are sized at
 ///   `window_size / 2` (integer division).
 /// * `threads` defaults to 10 when `None`.
+/// * Very small windows reduce the effective parallel range count.
 /// * `user_agent` defaults to `ripget/<version>` when `None`.
 /// * `buffer_size` defaults to 16MB when `None`.
 ///
 /// The returned [`WindowedDownload`] implements [`AsyncRead`]. Call
-/// [`WindowedDownload::finish`] to observe the final download status.
+/// [`WindowedDownload::finish`] to observe the final download status. Dropping
+/// the reader cancels the background download.
 pub async fn download_url_windowed(
     url: impl AsRef<str>,
     options: WindowedDownloadOptions,
@@ -504,7 +523,9 @@ pub async fn download_url_windowed(
     let threads = if metadata.len == 0 {
         0
     } else {
-        clamp_threads(requested_threads, metadata.len)
+        let threads = clamp_threads(requested_threads, metadata.len);
+        let max_window = metadata.len.min(buffer_len as u64);
+        clamp_window_threads(threads, max_window)
     };
     progress_set_threads(&options.progress, threads);
     let (result_tx, result_rx) = oneshot::channel();
@@ -512,13 +533,14 @@ pub async fn download_url_windowed(
 
     if metadata.len == 0 {
         let _ = result_tx.send(Ok(StreamReport {
-            url,
+            url: url.clone(),
             bytes: 0,
             threads: 0,
         }));
         return Ok(WindowedDownload {
             state,
-            result: result_rx,
+            result: Some(result_rx),
+            task: None,
             expected_len: 0,
             threads: 0,
             next_seq: 0,
@@ -532,8 +554,9 @@ pub async fn download_url_windowed(
 
     let progress = options.progress.clone();
     let state_task = state.clone();
+    let url = Arc::<str>::from(url);
 
-    tokio::spawn(async move {
+    let task = tokio::spawn(async move {
         let result = run_windowed_download(
             client,
             url,
@@ -550,7 +573,8 @@ pub async fn download_url_windowed(
 
     Ok(WindowedDownload {
         state,
-        result: result_rx,
+        result: Some(result_rx),
+        task: Some(task),
         expected_len: metadata.len,
         threads,
         next_seq: 0,
@@ -713,7 +737,7 @@ where
 #[allow(clippy::too_many_arguments)]
 async fn run_windowed_download(
     client: Client,
-    url: String,
+    url: Arc<str>,
     total_len: u64,
     buffer_len: usize,
     threads: usize,
@@ -763,7 +787,7 @@ async fn run_windowed_download(
             state.lens[idx].store(chunk_len, Ordering::Release);
             state.seqs[idx].store(seq, Ordering::Release);
             state.states[idx].store(BUFFER_READY, Ordering::Release);
-            state.notify.notify_waiters();
+            state.notify.notify_one();
 
             offset += chunk_len;
             idx = (idx + 1) % state.buffers.len();
@@ -774,12 +798,12 @@ async fn run_windowed_download(
     .await;
 
     state.done.store(true, Ordering::Release);
-    state.notify.notify_waiters();
+    state.notify.notify_one();
 
     download_result?;
 
     Ok(StreamReport {
-        url,
+        url: url.to_string(),
         bytes: total_len,
         threads,
     })
@@ -819,6 +843,12 @@ fn normalize_window_size(window_size: u64) -> Result<usize> {
 fn clamp_threads(threads: usize, total_len: u64) -> usize {
     let total = cmp::max(1, total_len) as usize;
     cmp::min(threads, total)
+}
+
+fn clamp_window_threads(threads: usize, window_len: u64) -> usize {
+    let threads = clamp_threads(threads, window_len);
+    let max_by_min = cmp::max(1, (window_len / MIN_WINDOW_RANGE) as usize);
+    cmp::min(threads, max_by_min)
 }
 
 fn split_ranges(total_len: u64, threads: usize) -> Vec<Range> {
@@ -1016,7 +1046,7 @@ async fn download_range(
 #[allow(clippy::too_many_arguments)]
 async fn download_window_in_memory(
     client: &Client,
-    url: &str,
+    url: &Arc<str>,
     buffer: SharedBuffer,
     window_start: u64,
     window_len: u64,
@@ -1029,22 +1059,22 @@ async fn download_window_in_memory(
         return Ok(());
     }
 
-    let threads = clamp_threads(threads, window_len);
+    let threads = clamp_window_threads(threads, window_len);
     let ranges = split_ranges(window_len, threads);
-    let mut join_set = JoinSet::new();
+    let mut tasks = FuturesUnordered::new();
     for range in ranges {
         let client = client.clone();
-        let url = url.to_string();
+        let url = url.clone();
         let buffer = buffer.clone();
         let progress = progress.clone();
         let request_range = Range {
             start: window_start + range.start,
             end: window_start + range.end,
         };
-        join_set.spawn(async move {
+        tasks.push(async move {
             download_range_window_to_buffer(
                 &client,
-                &url,
+                url,
                 &buffer,
                 range,
                 request_range,
@@ -1056,11 +1086,8 @@ async fn download_window_in_memory(
         });
     }
 
-    while let Some(result) = join_set.join_next().await {
-        match result {
-            Ok(inner) => inner?,
-            Err(err) => return Err(RipgetError::JoinError(err.to_string())),
-        }
+    while let Some(result) = tasks.next().await {
+        result?;
     }
     Ok(())
 }
@@ -1068,7 +1095,7 @@ async fn download_window_in_memory(
 #[allow(clippy::too_many_arguments)]
 async fn download_range_window_to_buffer(
     client: &Client,
-    url: &str,
+    url: Arc<str>,
     buffer: &SharedBuffer,
     file_range: Range,
     request_range: Range,
@@ -1085,7 +1112,7 @@ async fn download_range_window_to_buffer(
 
         let request_start = request_range.start + (offset - file_range.start);
         let response = match client
-            .get(url)
+            .get(url.as_ref())
             .header(
                 RANGE,
                 format!("bytes={}-{}", request_start, request_range.end),
