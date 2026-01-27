@@ -18,7 +18,7 @@ use std::cell::UnsafeCell;
 use std::cmp;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::task::{Context, Poll};
 use std::time::Duration;
@@ -69,6 +69,10 @@ pub enum RipgetError {
     HttpStatus { status: StatusCode, url: String },
     #[error("unexpected end of stream after {got} bytes, expected {expected}")]
     UnexpectedEof { expected: u64, got: u64 },
+    #[error("windowed download cancelled")]
+    WindowedDownloadCancelled,
+    #[error("windowed download invariant violated: {0}")]
+    WindowedDownloadInvariant(String),
     #[error("task failed: {0}")]
     JoinError(String),
     #[error(transparent)]
@@ -204,7 +208,7 @@ impl WindowedDownloadOptions {
 pub struct StreamReport {
     /// URL that was streamed.
     pub url: String,
-    /// Total bytes read.
+    /// Total bytes read from the stream.
     pub bytes: u64,
     /// Number of parallel ranges used.
     pub threads: usize,
@@ -215,6 +219,7 @@ pub struct WindowedDownload {
     state: Arc<WindowState>,
     result: Option<oneshot::Receiver<Result<StreamReport>>>,
     task: Option<tokio::task::JoinHandle<()>>,
+    url: Arc<str>,
     expected_len: u64,
     threads: usize,
     next_seq: u64,
@@ -237,12 +242,35 @@ impl WindowedDownload {
     }
 
     /// Wait for the background download to complete and return its report.
+    ///
+    /// If the stream was not fully read, this cancels the background download
+    /// and returns a report for the bytes that were read.
     pub async fn finish(mut self) -> Result<StreamReport> {
+        let partial = self.read_total < self.expected_len;
+        if partial && !self.state.done.load(Ordering::Acquire) {
+            self.state
+                .cancelled
+                .store(true, Ordering::Release);
+            self.state.notify.notify_one();
+        }
+        let read_total = self.read_total;
+        let url = self.url.clone();
+        let threads = self.threads;
         let result = self.result.take().ok_or_else(|| {
             RipgetError::JoinError("windowed download result already taken".to_string())
         })?;
         match result.await {
-            Ok(result) => result,
+            Ok(result) => {
+                if partial {
+                    Ok(StreamReport {
+                        url: url.to_string(),
+                        bytes: read_total,
+                        threads,
+                    })
+                } else {
+                    result
+                }
+            }
             Err(err) => Err(RipgetError::JoinError(err.to_string())),
         }
     }
@@ -252,6 +280,9 @@ impl Drop for WindowedDownload {
     fn drop(&mut self) {
         if let Some(handle) = self.task.take() {
             handle.abort();
+        }
+        if !self.state.done.load(Ordering::Acquire) {
+            self.state.cancelled.store(true, Ordering::Release);
         }
         self.state.done.store(true, Ordering::Release);
         self.state.notify.notify_one();
@@ -270,6 +301,12 @@ impl AsyncRead for WindowedDownload {
         }
 
         loop {
+            if let Some(err) = this.state.error() {
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    err.as_ref().to_string(),
+                )));
+            }
             if this.read_total >= this.expected_len {
                 return Poll::Ready(Ok(()));
             }
@@ -436,6 +473,8 @@ struct WindowState {
     seqs: [AtomicU64; 2],
     notify: Arc<Notify>,
     done: AtomicBool,
+    cancelled: AtomicBool,
+    error: Mutex<Option<Arc<str>>>,
 }
 
 impl WindowState {
@@ -447,7 +486,20 @@ impl WindowState {
             seqs: [AtomicU64::new(0), AtomicU64::new(0)],
             notify: Arc::new(Notify::new()),
             done: AtomicBool::new(false),
+            cancelled: AtomicBool::new(false),
+            error: Mutex::new(None),
         }
+    }
+
+    fn set_error(&self, message: impl Into<Arc<str>>) {
+        let mut guard = self.error.lock().unwrap();
+        if guard.is_none() {
+            *guard = Some(message.into());
+        }
+    }
+
+    fn error(&self) -> Option<Arc<str>> {
+        self.error.lock().unwrap().clone()
     }
 }
 
@@ -512,12 +564,12 @@ pub async fn download_url_windowed(
     url: impl AsRef<str>,
     options: WindowedDownloadOptions,
 ) -> Result<WindowedDownload> {
-    let url = url.as_ref().to_string();
+    let url = Arc::<str>::from(url.as_ref().to_string());
     let buffer_len = normalize_window_size(options.window_size)?;
     let requested_threads = normalize_threads(options.threads)?;
     let buffer_size = normalize_buffer_size(options.buffer_size)?;
     let client = build_client(options.user_agent.as_deref())?;
-    let metadata = fetch_metadata(&client, &url).await?;
+    let metadata = fetch_metadata(&client, url.as_ref()).await?;
     progress_init(&options.progress, metadata.len);
 
     let threads = if metadata.len == 0 {
@@ -533,7 +585,7 @@ pub async fn download_url_windowed(
 
     if metadata.len == 0 {
         let _ = result_tx.send(Ok(StreamReport {
-            url: url.clone(),
+            url: url.to_string(),
             bytes: 0,
             threads: 0,
         }));
@@ -541,6 +593,7 @@ pub async fn download_url_windowed(
             state,
             result: Some(result_rx),
             task: None,
+            url,
             expected_len: 0,
             threads: 0,
             next_seq: 0,
@@ -554,12 +607,12 @@ pub async fn download_url_windowed(
 
     let progress = options.progress.clone();
     let state_task = state.clone();
-    let url = Arc::<str>::from(url);
+    let url_task = url.clone();
 
     let task = tokio::spawn(async move {
         let result = run_windowed_download(
             client,
-            url,
+            url_task,
             metadata.len,
             buffer_len,
             threads,
@@ -575,6 +628,7 @@ pub async fn download_url_windowed(
         state,
         result: Some(result_rx),
         task: Some(task),
+        url,
         expected_len: metadata.len,
         threads,
         next_seq: 0,
@@ -750,7 +804,13 @@ async fn run_windowed_download(
         let mut idx = 0usize;
         let mut seq = 0u64;
         while offset < total_len {
+            if state.cancelled.load(Ordering::Acquire) {
+                return Err(RipgetError::WindowedDownloadCancelled);
+            }
             loop {
+                if state.cancelled.load(Ordering::Acquire) {
+                    return Err(RipgetError::WindowedDownloadCancelled);
+                }
                 let notified = state.notify.notified();
                 if state.states[idx]
                     .compare_exchange(
@@ -778,6 +838,7 @@ async fn run_windowed_download(
                 offset,
                 chunk_len,
                 threads,
+                &state.cancelled,
                 progress.clone(),
                 buffer_size,
                 allow_full_body,
@@ -797,6 +858,11 @@ async fn run_windowed_download(
     }
     .await;
 
+    if let Err(err) = &download_result {
+        if !matches!(err, RipgetError::WindowedDownloadCancelled) {
+            state.set_error(err.to_string());
+        }
+    }
     state.done.store(true, Ordering::Release);
     state.notify.notify_one();
 
@@ -871,6 +937,43 @@ fn split_ranges(total_len: u64, threads: usize) -> Vec<Range> {
         start = end + 1;
     }
     ranges
+}
+
+fn validate_window_ranges(ranges: &[Range], window_len: u64) -> Result<()> {
+    if window_len == 0 {
+        return Ok(());
+    }
+    if ranges.is_empty() {
+        return Err(RipgetError::WindowedDownloadInvariant(
+            "missing window ranges".to_string(),
+        ));
+    }
+    let mut expected_start = 0u64;
+    for (idx, range) in ranges.iter().enumerate() {
+        if range.start != expected_start {
+            return Err(RipgetError::WindowedDownloadInvariant(format!(
+                "range {idx} starts at {}, expected {expected_start}",
+                range.start
+            )));
+        }
+        if range.end < range.start {
+            return Err(RipgetError::WindowedDownloadInvariant(format!(
+                "range {idx} ends before start"
+            )));
+        }
+        if range.end >= window_len {
+            return Err(RipgetError::WindowedDownloadInvariant(format!(
+                "range {idx} ends past window"
+            )));
+        }
+        expected_start = range.end + 1;
+    }
+    if expected_start != window_len {
+        return Err(RipgetError::WindowedDownloadInvariant(
+            "ranges do not cover window".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 fn default_user_agent() -> String {
@@ -1051,6 +1154,7 @@ async fn download_window_in_memory(
     window_start: u64,
     window_len: u64,
     threads: usize,
+    cancelled: &AtomicBool,
     progress: Option<Progress>,
     buffer_size: usize,
     allow_full_body: bool,
@@ -1058,14 +1162,19 @@ async fn download_window_in_memory(
     if window_len == 0 {
         return Ok(());
     }
+    if cancelled.load(Ordering::Acquire) {
+        return Err(RipgetError::WindowedDownloadCancelled);
+    }
 
     let threads = clamp_window_threads(threads, window_len);
     let ranges = split_ranges(window_len, threads);
+    validate_window_ranges(&ranges, window_len)?;
     let mut tasks = FuturesUnordered::new();
     for range in ranges {
         let client = client.clone();
         let url = url.clone();
         let buffer = buffer.clone();
+        let cancelled = cancelled;
         let progress = progress.clone();
         let request_range = Range {
             start: window_start + range.start,
@@ -1078,6 +1187,7 @@ async fn download_window_in_memory(
                 &buffer,
                 range,
                 request_range,
+                cancelled,
                 progress,
                 buffer_size,
                 allow_full_body,
@@ -1099,6 +1209,7 @@ async fn download_range_window_to_buffer(
     buffer: &SharedBuffer,
     file_range: Range,
     request_range: Range,
+    cancelled: &AtomicBool,
     progress: Option<Progress>,
     buffer_size: usize,
     allow_full_body: bool,
@@ -1106,6 +1217,9 @@ async fn download_range_window_to_buffer(
     let mut offset = file_range.start;
     let mut attempt = 0usize;
     loop {
+        if cancelled.load(Ordering::Acquire) {
+            return Err(RipgetError::WindowedDownloadCancelled);
+        }
         if offset > file_range.end {
             return Ok(());
         }
@@ -1233,6 +1347,11 @@ async fn write_range_from_reader_to_buffer<R: AsyncRead + Unpin>(
         let read_len = cmp::min(remaining as usize, buffer_size);
         let start = *offset as usize;
         let end = start + read_len;
+        if end > buffer.len {
+            return Err(RipgetError::WindowedDownloadInvariant(
+                "buffer write out of bounds".to_string(),
+            ));
+        }
         let ptr = unsafe { buffer.write_ptr(start, end) };
         let slice = unsafe { std::slice::from_raw_parts_mut(ptr, read_len) };
         let n = read_fully_with_timeout(reader, slice, idle_timeout).await?;
