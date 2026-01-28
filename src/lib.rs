@@ -429,8 +429,7 @@ impl AsyncRead for WindowedDownload {
 
         loop {
             if let Some(err) = this.state.error() {
-                return Poll::Ready(Err(io::Error::new(
-                    io::ErrorKind::Other,
+                return Poll::Ready(Err(io::Error::other(
                     err.as_ref().to_string(),
                 )));
             }
@@ -1013,11 +1012,10 @@ async fn run_windowed_download(
     }
     .await;
 
-    if let Err(err) = &download_result {
-        if !matches!(err, RipgetError::WindowedDownloadCancelled) {
+    if let Err(err) = &download_result
+        && !matches!(err, RipgetError::WindowedDownloadCancelled) {
             state.set_error(err.to_string());
         }
-    }
     state.done.store(true, Ordering::Release);
     state.notify.notify_one();
 
@@ -1121,11 +1119,10 @@ async fn run_windowed_download_sequential(
     }
     .await;
 
-    if let Err(err) = &download_result {
-        if !matches!(err, RipgetError::WindowedDownloadCancelled) {
+    if let Err(err) = &download_result
+        && !matches!(err, RipgetError::WindowedDownloadCancelled) {
             state.set_error(err.to_string());
         }
-    }
     state.done.store(true, Ordering::Release);
     state.notify.notify_one();
 
@@ -1299,15 +1296,14 @@ async fn fetch_metadata(client: &Client, url: &str) -> Result<RemoteMetadata> {
             return Err(RipgetError::RangeNotSupported(url.to_string()));
         }
 
-        if status == StatusCode::RANGE_NOT_SATISFIABLE {
-            if let Some(content_range) = response.headers().get(CONTENT_RANGE) {
+        if status == StatusCode::RANGE_NOT_SATISFIABLE
+            && let Some(content_range) = response.headers().get(CONTENT_RANGE) {
                 let total_len = parse_content_range_unsatisfied(content_range, url)?;
                 return Ok(RemoteMetadata {
                     len: total_len,
                     supports_ranges: true,
                 });
             }
-        }
 
         let retry_after = retry_after_delay(response.headers());
         sleep_with_backoff(attempt, retry_after).await;
@@ -1480,7 +1476,6 @@ async fn download_window_in_memory(
         let client = client.clone();
         let url = url.clone();
         let buffer = buffer.clone();
-        let cancelled = cancelled;
         let progress = progress.clone();
         let request_range = Range {
             start: window_start + range.start,
