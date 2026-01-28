@@ -122,10 +122,12 @@
 //! # Retry behavior
 //! ripget retries network failures and most HTTP statuses with exponential backoff to handle
 //! throttling or transient outages. Only 404 and 500 responses are treated as fatal. Each
-//! range reconnects if no data arrives for 15 seconds.
+//! range reconnects if no data arrives for 15 seconds. If the server does not support range
+//! requests, ripget logs a warning and falls back to a single-threaded download.
 //!
 //! # Limitations
-//! - The server must support HTTP range requests and report the full size.
+//! - The server should report the full size. When range requests are unsupported, ripget
+//!   falls back to a single-threaded download.
 //!
 //! # License
 //! Licensed under either of:
@@ -525,6 +527,7 @@ struct Range {
 #[derive(Debug, Clone, Copy)]
 struct RemoteMetadata {
     len: u64,
+    supports_ranges: bool,
 }
 
 const BUFFER_EMPTY: u8 = 0;
@@ -682,6 +685,8 @@ pub async fn download_url_with_options(
 /// * Very small windows reduce the effective parallel range count.
 /// * `user_agent` defaults to `ripget/<version>` when `None`.
 /// * `buffer_size` defaults to 16MB when `None`.
+/// * If range requests are unsupported, this falls back to a single-threaded
+///   stream and logs a warning.
 ///
 /// The returned [`WindowedDownload`] implements [`AsyncRead`]. Call
 /// [`WindowedDownload::finish`] to observe the final download status (or a partial report if
@@ -700,6 +705,9 @@ pub async fn download_url_windowed(
 
     let threads = if metadata.len == 0 {
         0
+    } else if !metadata.supports_ranges {
+        warn_range_fallback(&url);
+        1
     } else {
         let threads = clamp_threads(requested_threads, metadata.len);
         let max_window = metadata.len.min(buffer_len as u64);
@@ -734,19 +742,33 @@ pub async fn download_url_windowed(
     let progress = options.progress.clone();
     let state_task = state.clone();
     let url_task = url.clone();
+    let supports_ranges = metadata.supports_ranges;
 
     let task = tokio::spawn(async move {
-        let result = run_windowed_download(
-            client,
-            url_task,
-            metadata.len,
-            buffer_len,
-            threads,
-            progress,
-            buffer_size,
-            state_task,
-        )
-        .await;
+        let result = if threads == 1 && !supports_ranges {
+            run_windowed_download_sequential(
+                client,
+                url_task,
+                metadata.len,
+                buffer_len,
+                progress,
+                buffer_size,
+                state_task,
+            )
+            .await
+        } else {
+            run_windowed_download(
+                client,
+                url_task,
+                metadata.len,
+                buffer_len,
+                threads,
+                progress,
+                buffer_size,
+                state_task,
+            )
+            .await
+        };
         let _ = result_tx.send(result);
     });
 
@@ -774,6 +796,8 @@ pub async fn download_url_windowed(
 /// * Range reads that stall for 15 seconds reconnect automatically.
 /// * `buffer_size` defaults to 16MB when `None`.
 /// * Existing files at `dest` are truncated and overwritten.
+/// * If range requests are unsupported, this falls back to a single-threaded
+///   download and logs a warning.
 pub async fn download_url_with_progress(
     url: impl AsRef<str>,
     dest: impl AsRef<Path>,
@@ -802,7 +826,12 @@ pub async fn download_url_with_progress(
 
     prepare_file(&dest, metadata.len).await?;
 
-    let threads = clamp_threads(requested_threads, metadata.len);
+    let threads = if metadata.supports_ranges {
+        clamp_threads(requested_threads, metadata.len)
+    } else {
+        warn_range_fallback(url);
+        1
+    };
     progress_set_threads(&progress, threads);
     let ranges = split_ranges(metadata.len, threads);
 
@@ -1001,6 +1030,114 @@ async fn run_windowed_download(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn run_windowed_download_sequential(
+    client: Client,
+    url: Arc<str>,
+    total_len: u64,
+    buffer_len: usize,
+    progress: Option<Progress>,
+    buffer_size: usize,
+    state: Arc<WindowState>,
+) -> Result<StreamReport> {
+    let download_result = async {
+        let response = match client.get(url.as_ref()).send().await {
+            Ok(resp) => resp,
+            Err(err) => return Err(RipgetError::Http(err)),
+        };
+
+        let status = response.status();
+        if is_fatal_status(status) {
+            return Err(RipgetError::HttpStatus {
+                status,
+                url: url.to_string(),
+            });
+        }
+        if status != StatusCode::OK {
+            return Err(RipgetError::HttpStatus {
+                status,
+                url: url.to_string(),
+            });
+        }
+
+        let stream = response.bytes_stream().map_err(io::Error::other);
+        let mut reader = StreamReader::new(stream);
+
+        let mut remaining = total_len;
+        let mut idx = 0usize;
+        let mut seq = 0u64;
+        while remaining > 0 {
+            if state.cancelled.load(Ordering::Acquire) {
+                return Err(RipgetError::WindowedDownloadCancelled);
+            }
+            loop {
+                if state.cancelled.load(Ordering::Acquire) {
+                    return Err(RipgetError::WindowedDownloadCancelled);
+                }
+                let notified = state.notify.notified();
+                if state.states[idx]
+                    .compare_exchange(
+                        BUFFER_EMPTY,
+                        BUFFER_WRITING,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .is_ok()
+                {
+                    break;
+                }
+                notified.await;
+            }
+
+            let chunk_len = remaining.min(buffer_len as u64);
+            let buffer = state.buffers[idx].clone();
+            let range = Range {
+                start: 0,
+                end: chunk_len.saturating_sub(1),
+            };
+            let mut offset = range.start;
+            write_range_from_reader_to_buffer(
+                &mut reader,
+                &buffer,
+                range,
+                &mut offset,
+                &progress,
+                buffer_size,
+                Some(READ_IDLE_TIMEOUT),
+            )
+            .await?;
+
+            state.lens[idx].store(chunk_len, Ordering::Release);
+            state.seqs[idx].store(seq, Ordering::Release);
+            state.states[idx].store(BUFFER_READY, Ordering::Release);
+            state.notify.notify_one();
+
+            remaining -= chunk_len;
+            idx = (idx + 1) % state.buffers.len();
+            seq = seq.saturating_add(1);
+        }
+
+        Ok::<(), RipgetError>(())
+    }
+    .await;
+
+    if let Err(err) = &download_result {
+        if !matches!(err, RipgetError::WindowedDownloadCancelled) {
+            state.set_error(err.to_string());
+        }
+    }
+    state.done.store(true, Ordering::Release);
+    state.notify.notify_one();
+
+    download_result?;
+
+    Ok(StreamReport {
+        url: url.to_string(),
+        bytes: total_len,
+        threads: 1,
+    })
+}
+
 fn normalize_threads(threads: Option<usize>) -> Result<usize> {
     let threads = threads.unwrap_or(DEFAULT_THREADS);
     if threads == 0 {
@@ -1140,20 +1277,41 @@ async fn fetch_metadata(client: &Client, url: &str) -> Result<RemoteMetadata> {
                 url: url.to_string(),
             });
         }
-        if status != StatusCode::PARTIAL_CONTENT {
-            let retry_after = retry_after_delay(response.headers());
-            sleep_with_backoff(attempt, retry_after).await;
-            attempt = attempt.saturating_add(1);
-            continue;
+        if status == StatusCode::PARTIAL_CONTENT {
+            let content_range = response
+                .headers()
+                .get(CONTENT_RANGE)
+                .ok_or_else(|| RipgetError::ContentRangeMissing(url.to_string()))?;
+            let total_len = parse_content_range_total(content_range, url)?;
+            return Ok(RemoteMetadata {
+                len: total_len,
+                supports_ranges: true,
+            });
         }
 
-        let content_range = response
-            .headers()
-            .get(CONTENT_RANGE)
-            .ok_or_else(|| RipgetError::ContentRangeMissing(url.to_string()))?;
-        let total_len = parse_content_range_total(content_range, url)?;
+        if status == StatusCode::OK {
+            if let Some(total_len) = response.content_length() {
+                return Ok(RemoteMetadata {
+                    len: total_len,
+                    supports_ranges: false,
+                });
+            }
+            return Err(RipgetError::RangeNotSupported(url.to_string()));
+        }
 
-        return Ok(RemoteMetadata { len: total_len });
+        if status == StatusCode::RANGE_NOT_SATISFIABLE {
+            if let Some(content_range) = response.headers().get(CONTENT_RANGE) {
+                let total_len = parse_content_range_unsatisfied(content_range, url)?;
+                return Ok(RemoteMetadata {
+                    len: total_len,
+                    supports_ranges: true,
+                });
+            }
+        }
+
+        let retry_after = retry_after_delay(response.headers());
+        sleep_with_backoff(attempt, retry_after).await;
+        attempt = attempt.saturating_add(1);
     }
 }
 
@@ -1169,6 +1327,28 @@ fn parse_content_range_total(value: &HeaderValue, url: &str) -> Result<u64> {
         .next()
         .ok_or_else(|| RipgetError::InvalidContentRange(url.to_string()))?;
     if parts.next().is_some() || total == "*" {
+        return Err(RipgetError::InvalidContentRange(url.to_string()));
+    }
+    total
+        .parse::<u64>()
+        .map_err(|_| RipgetError::InvalidContentRange(url.to_string()))
+}
+
+fn parse_content_range_unsatisfied(value: &HeaderValue, url: &str) -> Result<u64> {
+    let value = value
+        .to_str()
+        .map_err(|_| RipgetError::InvalidContentRange(url.to_string()))?;
+    let mut parts = value.split('/');
+    let range = parts
+        .next()
+        .ok_or_else(|| RipgetError::InvalidContentRange(url.to_string()))?;
+    let total = parts
+        .next()
+        .ok_or_else(|| RipgetError::InvalidContentRange(url.to_string()))?;
+    if parts.next().is_some() || total == "*" {
+        return Err(RipgetError::InvalidContentRange(url.to_string()));
+    }
+    if range.trim() != "bytes *" {
         return Err(RipgetError::InvalidContentRange(url.to_string()));
     }
     total
@@ -1547,6 +1727,13 @@ fn progress_add(progress: &Option<Progress>, delta: u64) {
     }
 }
 
+fn warn_range_fallback(url: &str) {
+    log::warn!(
+        "range requests not supported by {}, falling back to single-threaded download",
+        url
+    );
+}
+
 fn is_fatal_status(status: StatusCode) -> bool {
     status == StatusCode::NOT_FOUND || status == StatusCode::INTERNAL_SERVER_ERROR
 }
@@ -1649,6 +1836,25 @@ mod tests {
         }
     }
 
+    fn handle_request_no_range(req: Request<Body>, data: Arc<Vec<u8>>) -> Response<Body> {
+        match *req.method() {
+            Method::HEAD => Response::builder()
+                .status(StatusCode::OK)
+                .header(CONTENT_LENGTH, data.len().to_string())
+                .body(Body::empty())
+                .unwrap(),
+            Method::GET => Response::builder()
+                .status(StatusCode::OK)
+                .header(CONTENT_LENGTH, data.len().to_string())
+                .body(Body::from(data.as_slice().to_vec()))
+                .unwrap(),
+            _ => Response::builder()
+                .status(StatusCode::METHOD_NOT_ALLOWED)
+                .body(Body::empty())
+                .unwrap(),
+        }
+    }
+
     fn parse_range_header(value: &str, len: usize) -> Option<(usize, usize)> {
         let value = value.strip_prefix("bytes=")?;
         let mut parts = value.splitn(2, '-');
@@ -1671,6 +1877,28 @@ mod tests {
                 Ok::<_, Infallible>(service_fn(move |req| {
                     let data = data.clone();
                     async move { Ok::<_, Infallible>(handle_request(req, data)) }
+                }))
+            }
+        });
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = Server::from_tcp(listener).unwrap().serve(make_svc);
+        let (tx, rx) = oneshot::channel();
+        let graceful = server.with_graceful_shutdown(async {
+            let _ = rx.await;
+        });
+        tokio::spawn(graceful);
+        (addr, tx)
+    }
+
+    async fn spawn_no_range_server(data: Arc<Vec<u8>>) -> (SocketAddr, oneshot::Sender<()>) {
+        let make_svc = make_service_fn(move |_| {
+            let data = data.clone();
+            async move {
+                Ok::<_, Infallible>(service_fn(move |req| {
+                    let data = data.clone();
+                    async move { Ok::<_, Infallible>(handle_request_no_range(req, data)) }
                 }))
             }
         });
@@ -1765,6 +1993,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn download_url_falls_back_without_ranges() -> Result<()> {
+        let data: Vec<u8> = (0..(256 * 1024)).map(|i| (i % 251) as u8).collect();
+        let (addr, shutdown) = spawn_no_range_server(Arc::new(data.clone())).await;
+
+        let dir = tempdir()?;
+        let path = dir.path().join("file.bin");
+        let url = format!("http://{}/file.bin", addr);
+
+        let report = download_url(&url, &path, Some(4), None).await?;
+        assert_eq!(report.bytes as usize, data.len());
+        assert_eq!(report.threads, 1);
+
+        let downloaded = tokio::fs::read(&path).await?;
+        assert_eq!(downloaded, data);
+        let _ = shutdown.send(());
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn download_url_windowed_streams() -> Result<()> {
         let data: Vec<u8> = (0..(256 * 1024)).map(|i| (i % 251) as u8).collect();
         let (addr, shutdown) = spawn_range_server(Arc::new(data.clone())).await;
@@ -1778,6 +2025,26 @@ mod tests {
 
         assert_eq!(received, data);
         assert_eq!(report.bytes as usize, data.len());
+
+        let _ = shutdown.send(());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn download_url_windowed_falls_back_without_ranges() -> Result<()> {
+        let data: Vec<u8> = (0..(256 * 1024)).map(|i| (i % 251) as u8).collect();
+        let (addr, shutdown) = spawn_no_range_server(Arc::new(data.clone())).await;
+
+        let url = format!("http://{}/file.bin", addr);
+        let options = WindowedDownloadOptions::new(64 * 1024).threads(4);
+        let mut download = download_url_windowed(&url, options).await?;
+        let mut received = Vec::new();
+        download.read_to_end(&mut received).await?;
+        let report = download.finish().await?;
+
+        assert_eq!(received, data);
+        assert_eq!(report.bytes as usize, data.len());
+        assert_eq!(report.threads, 1);
 
         let _ = shutdown.send(());
         Ok(())

@@ -126,10 +126,12 @@ println!("downloaded {} bytes", report.bytes);
 ## Retry behavior
 ripget retries network failures and most HTTP statuses with exponential backoff to handle
 throttling or transient outages. Only 404 and 500 responses are treated as fatal. Each range
-reconnects if no data arrives for 15 seconds.
+reconnects if no data arrives for 15 seconds. If the server does not support range requests,
+ripget logs a warning and falls back to a single-threaded download.
 
 ## Limitations
-- The server must support HTTP range requests and report the full size.
+- The server should report the full size. When range requests are unsupported, ripget falls
+  back to a single-threaded download.
 
 ## License
 Licensed under either of:
