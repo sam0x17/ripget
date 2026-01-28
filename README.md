@@ -19,13 +19,13 @@ similar in spirit to aria2c.
 - Async library API powered by tokio and reqwest
 
 ## Install
-```
+```sh
 cargo install ripget
 ```
 
 ## CLI usage
 Download to the current directory using the URL filename:
-```
+```sh
 ripget "https://example.com/assets/large.bin"
 ```
 
@@ -34,12 +34,12 @@ disable the progress bar. Use `--threads` or `RIPGET_THREADS` to override the de
 count.
 
 Override the buffer size:
-```
+```sh
 ripget --cache-size 8mb "https://example.com/assets/large.bin"
 ```
 
 Override the output name:
-```
+```sh
 ripget "https://example.com/assets/large.bin" my_file.blob
 ```
 
@@ -55,7 +55,7 @@ ripget "https://example.com/assets/large.bin" my_file.blob
 - `--cache-size <SIZE>`: override the read buffer size (e.g. `8mb`)
 
 ## Library usage
-```
+```rust
 use ripget::download_url;
 
 # #[tokio::main]
@@ -72,7 +72,7 @@ println!("downloaded {} bytes", report.bytes);
 ```
 
 Override the user agent programmatically:
-```
+```rust
 let options = ripget::DownloadOptions::new()
     .user_agent(format!("my-app/{}", env!("CARGO_PKG_VERSION")));
 let report = ripget::download_url_with_options(
@@ -84,7 +84,7 @@ println!("downloaded {} bytes", report.bytes);
 ```
 
 Windowed streaming (double-buffered range download):
-```
+```rust
 # #[tokio::main]
 # async fn main() -> Result<(), ripget::RipgetError> {
 let options = ripget::WindowedDownloadOptions::new(10 * 1024 * 1024)
@@ -107,7 +107,7 @@ copies. If the stream is dropped or `finish()` is called early, the background d
 cancelled and `finish()` returns a report for the bytes read.
 
 For async readers with a known length:
-```
+```rust
 use tokio::io::{self, AsyncWriteExt};
 
 # #[tokio::main]
