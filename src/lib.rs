@@ -429,9 +429,7 @@ impl AsyncRead for WindowedDownload {
 
         loop {
             if let Some(err) = this.state.error() {
-                return Poll::Ready(Err(io::Error::other(
-                    err.as_ref().to_string(),
-                )));
+                return Poll::Ready(Err(io::Error::other(err.as_ref().to_string())));
             }
             if this.read_total >= this.expected_len {
                 return Poll::Ready(Ok(()));
@@ -1013,9 +1011,10 @@ async fn run_windowed_download(
     .await;
 
     if let Err(err) = &download_result
-        && !matches!(err, RipgetError::WindowedDownloadCancelled) {
-            state.set_error(err.to_string());
-        }
+        && !matches!(err, RipgetError::WindowedDownloadCancelled)
+    {
+        state.set_error(err.to_string());
+    }
     state.done.store(true, Ordering::Release);
     state.notify.notify_one();
 
@@ -1120,9 +1119,10 @@ async fn run_windowed_download_sequential(
     .await;
 
     if let Err(err) = &download_result
-        && !matches!(err, RipgetError::WindowedDownloadCancelled) {
-            state.set_error(err.to_string());
-        }
+        && !matches!(err, RipgetError::WindowedDownloadCancelled)
+    {
+        state.set_error(err.to_string());
+    }
     state.done.store(true, Ordering::Release);
     state.notify.notify_one();
 
@@ -1297,13 +1297,14 @@ async fn fetch_metadata(client: &Client, url: &str) -> Result<RemoteMetadata> {
         }
 
         if status == StatusCode::RANGE_NOT_SATISFIABLE
-            && let Some(content_range) = response.headers().get(CONTENT_RANGE) {
-                let total_len = parse_content_range_unsatisfied(content_range, url)?;
-                return Ok(RemoteMetadata {
-                    len: total_len,
-                    supports_ranges: true,
-                });
-            }
+            && let Some(content_range) = response.headers().get(CONTENT_RANGE)
+        {
+            let total_len = parse_content_range_unsatisfied(content_range, url)?;
+            return Ok(RemoteMetadata {
+                len: total_len,
+                supports_ranges: true,
+            });
+        }
 
         let retry_after = retry_after_delay(response.headers());
         sleep_with_backoff(attempt, retry_after).await;

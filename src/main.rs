@@ -117,10 +117,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn init_logging() {
-    let _ = env_logger::Builder::from_env(
-        env_logger::Env::default().default_filter_or("warn"),
-    )
-    .try_init();
+    let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn"))
+        .try_init();
 }
 
 fn default_output_path(url: &str) -> Result<PathBuf, Box<dyn std::error::Error>> {
