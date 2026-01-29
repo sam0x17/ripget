@@ -1,0 +1,12 @@
+# Build artifacts
+/target/
+/dist/
+*.so
+*.whl
+
+# Cargo.lock for library crate (generated from parent)
+Cargo.lock
+
+# Virtual environment
+.venv/
+
