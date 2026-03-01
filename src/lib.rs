@@ -1249,6 +1249,8 @@ fn build_client(user_agent: Option<&str>) -> Result<Client> {
     Ok(Client::builder()
         .default_headers(headers)
         .user_agent(agent)
+        .use_rustls_tls()
+        .http1_only()
         .build()?)
 }
 
