@@ -145,8 +145,9 @@ use std::time::Duration;
 
 use futures_util::TryStreamExt;
 use futures_util::stream::{FuturesUnordered, StreamExt};
+pub use reqwest::Client;
+use reqwest::StatusCode;
 use reqwest::header::{ACCEPT_ENCODING, CONTENT_RANGE, HeaderMap, HeaderValue, RANGE, RETRY_AFTER};
-use reqwest::{Client, StatusCode};
 use tokio::fs::OpenOptions;
 use tokio::io::{self, AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWriteExt, SeekFrom};
 use tokio::sync::{Notify, oneshot};
@@ -287,6 +288,8 @@ pub struct WindowedDownloadOptions {
     pub progress: Option<Progress>,
     /// Override the read buffer size.
     pub buffer_size: Option<usize>,
+    /// Pre-built HTTP client for connection reuse across downloads.
+    pub client: Option<Client>,
 }
 
 impl WindowedDownloadOptions {
@@ -300,6 +303,7 @@ impl WindowedDownloadOptions {
             user_agent: None,
             progress: None,
             buffer_size: None,
+            client: None,
         }
     }
 
@@ -324,6 +328,12 @@ impl WindowedDownloadOptions {
     /// Override the read buffer size.
     pub fn buffer_size(mut self, buffer_size: usize) -> Self {
         self.buffer_size = Some(buffer_size);
+        self
+    }
+
+    /// Supply a pre-built HTTP client to reuse connections across downloads.
+    pub fn client(mut self, client: Client) -> Self {
+        self.client = Some(client);
         self
     }
 }
@@ -696,7 +706,10 @@ pub async fn download_url_windowed(
     let buffer_len = normalize_window_size(options.window_size)?;
     let requested_threads = normalize_threads(options.threads)?;
     let buffer_size = normalize_buffer_size(options.buffer_size)?;
-    let client = build_client(options.user_agent.as_deref())?;
+    let client = match options.client {
+        Some(c) => c,
+        None => build_client(options.user_agent.as_deref())?,
+    };
     let metadata = fetch_metadata(&client, url.as_ref()).await?;
     progress_init(&options.progress, metadata.len);
 
@@ -1240,7 +1253,12 @@ fn default_user_agent() -> String {
     format!("ripget/{}", env!("CARGO_PKG_VERSION"))
 }
 
-fn build_client(user_agent: Option<&str>) -> Result<Client> {
+/// Builds a reusable HTTP client configured for ripget downloads.
+///
+/// The returned [`Client`] uses HTTP/1.1 only (separate TCP connections per request),
+/// connection pooling with keep-alive, and identity encoding. Pass the client via
+/// [`WindowedDownloadOptions::client`] to reuse connections across multiple downloads.
+pub fn build_client(user_agent: Option<&str>) -> Result<Client> {
     let mut headers = HeaderMap::new();
     headers.insert(ACCEPT_ENCODING, HeaderValue::from_static("identity"));
     let agent = user_agent
@@ -1251,6 +1269,8 @@ fn build_client(user_agent: Option<&str>) -> Result<Client> {
         .user_agent(agent)
         .use_rustls_tls()
         .http1_only()
+        .pool_idle_timeout(Duration::from_secs(90))
+        .tcp_keepalive(Duration::from_secs(60))
         .build()?)
 }
 
